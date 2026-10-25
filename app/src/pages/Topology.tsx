@@ -52,7 +52,7 @@ export default function Topology() {
   const reduce = useReducedMotion()
   const { isDemo } = useNetPulse()
   const auth = useAuth()
-  const { routers, devices, wan, wireguard, distributionNodes, topology, vm, lastSnapshotAt, requestServerRefresh } =
+  const { routers, devices, wan, routerWans, wireguard, wireguards, distributionNodes, topology, vm, lastSnapshotAt, requestServerRefresh } =
     useNetPulse()
   const [showLabels, setShowLabels] = useState(true)
   // Flujo de paquetes: sin toggle propio (feedback #656); lo gobierna el
@@ -103,13 +103,15 @@ export default function Topology() {
         routers,
         devices,
         wan,
+        routerWans,
         wireguard,
+        wireguards,
         distributionNodes,
         topology,
         vm,
         seedPositions: Object.keys(layout).length > 0 ? layout : undefined,
       }),
-    [routers, devices, wan, wireguard, distributionNodes, topology, vm, layout],
+    [routers, devices, wan, routerWans, wireguard, wireguards, distributionNodes, topology, vm, layout],
   )
 
   // Durante el arrastre, onMoveNode actualiza la posición del nodo en `layout`

@@ -182,15 +182,17 @@ func (d *Demo) Tick(context.Context) error {
 // Snapshotter
 // ---------------------------------------------------------------------------
 
-func (d *Demo) Mode() string              { return "demo" }
-func (d *Demo) SetRouters([]RouterConfig) {} // la demo ignora la configuración
-func (d *Demo) Close() error              { return nil }
+func (d *Demo) Mode() string                { return "demo" }
+func (d *Demo) SetRouters([]RouterConfig)   {} // la demo ignora la configuración
+func (d *Demo) Close() error                { return nil }
 func (d *Demo) DismissUnknownDevice(string) {}
 
 func (d *Demo) GetUsteer(context.Context) (*Usteer, error) { return nil, nil }
 
 // KickUsteerClient no-op en demo.
-func (d *Demo) KickUsteerClient(context.Context, string) error { return errors.New("not available in demo") }
+func (d *Demo) KickUsteerClient(context.Context, string) error {
+	return errors.New("not available in demo")
+}
 
 // GetReanchorRecommendations no-op en demo.
 func (d *Demo) GetReanchorRecommendations(context.Context, ReanchorConfig) ([]ReanchorRecommendation, RoamingDaemon, error) {
@@ -219,6 +221,7 @@ func (d *Demo) buildOverview() *Overview {
 		Traffic:           canonTraffic(),
 		Adguard:           d.adguard,
 		Wireguard:         wg,
+		Wireguards:        []RouterWireGuard{{RouterID: "flint2", Stats: wg}},
 		Routers:           d.routersCopy(),
 		DeviceTotals:      deviceTotalsOf(d.devices), // D5: derivado del dataset
 		TopDevices:        d.topDevices(5),
@@ -234,9 +237,13 @@ func (d *Demo) buildOverview() *Overview {
 func (d *Demo) wireguardSnapshot() WireGuardStats {
 	peers := make([]WGPeer, len(d.wireguard.Peers))
 	copy(peers, d.wireguard.Peers)
+	for i := range peers {
+		peers[i].LocalRole = "server"
+	}
 	return WireGuardStats{
 		Interface: d.wireguard.Interface, Subnet: d.wireguard.Subnet,
 		Status: d.wireguard.Status, Peers: peers,
+		Instances: []WireGuardInstance{{Interface: d.wireguard.Interface, Status: d.wireguard.Status, Role: "server", Peers: peers}},
 	}
 }
 
@@ -327,6 +334,10 @@ func (d *Demo) GetRouterDetail(_ context.Context, id string) (*RouterDetail, err
 	if id == demoGatewayID {
 		ag := d.adguard
 		wg := d.wireguardSnapshot()
+		latency, loss := d.wan.LatencyMs, d.wan.LossPct
+		down, up := d.wan.DownMbps, d.wan.UpMbps
+		detail.WAN = &RouterWAN{Proto: d.wan.Proto, PublicIP: d.wan.PublicIP, Gateway: d.wan.Gateway, DNS: d.wan.DNS, DownMbps: &down, UpMbps: &up, LatencyMs: &latency, LossPct: &loss}
+		detail.WANTraffic24h = canonTraffic().H24
 		detail.Adguard = &ag
 		detail.Wireguard = &wg
 		detail.AdguardSeries24h = d.adguardSeries

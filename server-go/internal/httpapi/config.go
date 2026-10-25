@@ -7,6 +7,7 @@ package httpapi
 
 import (
 	"database/sql"
+	"errors"
 	"net/http"
 	urlpkg "net/url"
 	"regexp"
@@ -92,17 +93,20 @@ func (s *server) handleListConfigRouters(w http.ResponseWriter, r *http.Request)
 }
 
 type routerInput struct {
-	Name      *string `json:"name"`
-	Host      *string `json:"host"`
-	Type      string  `json:"type"`
-	Gateway   bool    `json:"gateway"`
-	AgentOnly bool    `json:"agent_only"`
+	Name    *string `json:"name"`
+	Host    *string `json:"host"`
+	Type    string  `json:"type"`
+	Gateway *bool   `json:"gateway"`
+	Router  *bool   `json:"router"`
+	// Legacy request field retained for clients built before the router role.
+	SecondaryRouter *bool `json:"secondary_router"`
+	AgentOnly       *bool `json:"agent_only"`
 	// FirmwareTarget: versión objetivo del firmware (issue #241; opcional).
 	FirmwareTarget *string `json:"firmware_target"`
 	// SNMP (issue #309): credenciales para sondeo SNMP del switch gestionado.
-	SnmpEnabled      *bool   `json:"snmp_enabled"`
+	SnmpEnabled *bool `json:"snmp_enabled"`
 	// ConsolePolling (issue #863): sondeo HTTP de la consola del switch.
-	ConsolePolling *bool `json:"console_polling"`
+	ConsolePolling   *bool   `json:"console_polling"`
 	SnmpCommunity    *string `json:"snmp_community"`
 	SnmpPort         *int    `json:"snmp_port"`
 	SnmpPollInterval *int    `json:"snmp_poll_interval"` // issue #414; segundos
@@ -236,13 +240,24 @@ func (s *server) handleAddConfigRouter(w http.ResponseWriter, r *http.Request) {
 		}
 		sshPort = p
 	}
+	role := in.Router
+	if role == nil {
+		role = in.SecondaryRouter
+	}
 	created, err := routerstore.AddRouter(s.db.DB, routerstore.AddInput{
-		Name: name, Host: host, Type: typ, IsGateway: in.Gateway, AgentOnly: in.AgentOnly,
+		Name: name, Host: host, Type: typ,
+		IsGateway:      in.Gateway != nil && *in.Gateway,
+		IsRouter:       role != nil && *role,
+		AgentOnly:      in.AgentOnly != nil && *in.AgentOnly,
 		FirmwareTarget: firmwareTarget,
 		SnmpEnabled:    snmpEnabled, SnmpCommunity: snmpCommunity, SnmpPort: snmpPort, SnmpPollInterval: snmpInterval,
 		SSHPort: sshPort,
 	})
 	if err != nil {
+		if errors.Is(err, routerstore.ErrInvalidRole) {
+			writeError(w, http.StatusBadRequest, "invalid_input", err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "internal_error")
 		return
 	}
@@ -307,8 +322,6 @@ func (s *server) handleUpdateConfigRouter(w http.ResponseWriter, r *http.Request
 		}
 		typ = &t
 	}
-	gw := in.Gateway
-	ao := in.AgentOnly
 	var firmwareTarget *string
 	if in.FirmwareTarget != nil {
 		v := strings.TrimSpace(*in.FirmwareTarget)
@@ -355,17 +368,28 @@ func (s *server) handleUpdateConfigRouter(w http.ResponseWriter, r *http.Request
 		}
 		tempThreshold = &v
 	}
-	updated, ok := routerstore.UpdateRouter(s.db.DB, id, routerstore.UpdateInput{
+	role := in.Router
+	if role == nil {
+		role = in.SecondaryRouter
+	}
+	updated, err := routerstore.UpdateRouter(s.db.DB, id, routerstore.UpdateInput{
 		Name: name, Host: host, Type: typ,
-		IsGateway: &gw, AgentOnly: &ao,
+		IsGateway: in.Gateway, IsRouter: role, AgentOnly: in.AgentOnly,
 		FirmwareTarget: firmwareTarget,
 		SnmpEnabled:    in.SnmpEnabled, SnmpCommunity: snmpCommunity, SnmpPort: snmpPort, SnmpPollInterval: snmpPollInterval,
 		SSHPort:        sshPort,
 		TempThreshold:  tempThreshold,
 		ConsolePolling: in.ConsolePolling,
 	})
-	if !ok {
-		writeError(w, http.StatusNotFound, "not_found")
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			writeError(w, http.StatusNotFound, "not_found")
+		case errors.Is(err, routerstore.ErrInvalidRole):
+			writeError(w, http.StatusBadRequest, "invalid_input", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error")
+		}
 		return
 	}
 	s.syncRouters()

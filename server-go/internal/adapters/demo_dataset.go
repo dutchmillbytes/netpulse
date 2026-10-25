@@ -140,7 +140,7 @@ func canonAdguard() AdGuardStats {
 }
 
 func canonWireguard() WireGuardStats {
-	return WireGuardStats{
+	stats := WireGuardStats{
 		Interface: "wg0", Subnet: "10.0.0.1/24", Status: "active",
 		Peers: []WGPeer{
 			{ID: "pixel-8-pro", Name: "Pixel 8 Pro", Type: "movil", TunnelIP: "10.0.0.2", Active: true, LastHandshake: "hace 38 s", Rx: "1,2 GB", Tx: "214 MB"},
@@ -150,6 +150,11 @@ func canonWireguard() WireGuardStats {
 			{ID: "casa-familia", Name: "Casa familia", Type: "sitio", TunnelIP: "10.0.0.6", Active: false, LastHandshake: "hace 9 días", Rx: "12 GB", Tx: "4,2 GB"},
 		},
 	}
+	for i := range stats.Peers {
+		stats.Peers[i].LocalRole = "server"
+	}
+	stats.Instances = []WireGuardInstance{{Interface: stats.Interface, Status: stats.Status, Role: "server", Peers: stats.Peers}}
+	return stats
 }
 
 // alertText: pareja de textos de una alerta demo en es/en (issue #239). El

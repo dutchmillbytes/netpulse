@@ -10,12 +10,13 @@
  *   - DistributionNode: puerto con varias MACs en el FDB → OUI heterogéneo =
  *     "Switch o bridge (inferido)" (círculo dashed); OUI de hipervisor =
  *     host con badge +N y sus CTs/VMs anidados en grid.
- *   - Túneles WG trazados peer → Internet (el camino físico real es la nube).
+ *   - Túneles WG por router → peer compartido cuando hay varios routing roots;
+ *     el Internet físico sigue representado por los enlaces WAN.
  * Layout: gateway/APs en coordenadas canónicas; wifi en anillos concéntricos
  * con arcos prohibidos (uplink, etiqueta, WAN, abanico cableado); cableados
  * en abanicos por hub; CTs en grid bajo el host.
  */
-import type { Band, Device, DistributionNode, Router, TopoSemantics, TopoSemLink, WanInfo, WGPeer, WireGuardStats } from '@/data/mock'
+import type { Band, Device, DistributionNode, Router, RouterWanInfo, RouterWireGuard, TopoSemantics, TopoSemLink, WanInfo, WGPeer, WireGuardStats } from '@/data/types'
 
 /** viewBox del lienzo SVG */
 export const VB_W = 1000
@@ -29,6 +30,8 @@ export interface RouterNode {
   kind: 'router'
   id: string
   router: Router
+  /** Short on-map name for crowded multi-router layouts; tooltip keeps the FQDN. */
+  displayName?: string
   x: number
   y: number
   /** radio del círculo interior */
@@ -38,10 +41,20 @@ export interface RouterNode {
 
 export interface PeerNode {
   kind: 'peer'
-  id: string // `peer-${peer.id}`
+  id: string // stable remote key identity, or router-scoped fallback
   peer: WGPeer
   x: number
   y: number
+}
+
+export interface InternetNode {
+  id: string
+  routerId: string
+  router: Router
+  wan: { isp?: string; plan?: string; publicIp?: string; latencyMs?: number; lossPct?: number; downMbps?: number }
+  x: number
+  y: number
+  r: number
 }
 
 /** Chip de un dispositivo cliente (wifi o cableado). */
@@ -91,6 +104,8 @@ export interface TopoLink {
   packetDur: number
   from: string
   to: string
+  active?: boolean
+  interface?: string
 }
 
 export interface BackhaulRow {
@@ -115,7 +130,9 @@ export interface TopologyInput {
   routers: Router[]
   devices: Device[]
   wan: WanInfo
+  routerWans?: Record<string, RouterWanInfo>
   wireguard: WireGuardStats
+  wireguards?: RouterWireGuard[]
   distributionNodes?: DistributionNode[]
   /**
    * Semántica de topología precalculada server-side (SPEC-65 D65-3/D65-9 B2):
@@ -149,9 +166,10 @@ export interface RingOverflowChip {
 
 export interface TopologyModel {
   gatewayNode: RouterNode | null
+  secondaryNodes: RouterNode[]
   apNodes: RouterNode[]
   routerNodes: RouterNode[]
-  internetNode: { id: 'internet'; x: number; y: number }
+  internetNodes: InternetNode[]
   peerNodes: PeerNode[]
   /** Peers activos que exceden las coordenadas canónicas (chip "+N") */
   hiddenPeers: WGPeer[]
@@ -246,6 +264,12 @@ const PEER_COORDS = [
   { x: 735, y: 26 },
   { x: 140, y: 26 },
   { x: 860, y: 26 },
+]
+const MULTI_PEER_COORDS = [
+  { x: 500, y: 105 },
+  { x: 255, y: 80 },
+  { x: 745, y: 80 },
+  { x: 500, y: 175 },
 ]
 /** Duración del paquete animado por peer en los túneles WG. Las curvas se
  *  calculan SIEMPRE dinámicas (peer → posición real de Internet): las
@@ -627,19 +651,88 @@ function flowFor(mbps: number, alive = false): { packets: number; packetDur: num
 // Builder
 // ---------------------------------------------------------------------------
 
-export function buildTopologyModel({ routers, devices, wan, wireguard, distributionNodes = [], topology, vm, seedPositions }: TopologyInput): TopologyModel {
+export function buildTopologyModel({ routers, devices, wan, routerWans = {}, wireguard, wireguards, distributionNodes = [], topology, vm, seedPositions }: TopologyInput): TopologyModel {
   // SPEC-65 D65-3/D65-9 B2: la semántica server-side aplica con vm >= 1 y
-  // `topology` presente; sin ella, fallback EXACTO al cálculo local.
-  const sem = topology && (vm ?? 1) >= 1 ? topology : undefined
+  // `topology` presente; sin ella, se infieren padres localmente.
+  const incomingSem = topology && (vm ?? 1) >= 1 ? topology : undefined
   const gateway = routers.find((r) => r.roleBadge === 'Principal') ?? routers[0]
-  const aps = routers.filter((r) => r.id !== gateway?.id && r.roleBadge !== 'SW')
+  const secondary = routers.filter((r) => r.roleBadge === 'Secondary' && r.id !== gateway?.id)
+  const roots = gateway ? [gateway, ...secondary] : secondary
+  const rootIds = new Set(roots.map((r) => r.id))
+  // A frontend may be refreshed before the Go server. Older semantic bundles
+  // put the secondary under the primary and WG peers under Internet; ignore
+  // that graph until the server begins emitting independent routing roots.
+  const staleMultiRouterSem = roots.length > 1 && incomingSem?.links.some((link) =>
+    (link.kind === 'uplink' && rootIds.has(link.to)) || (link.kind === 'wg' && link.to === 'internet'))
+  const sem = staleMultiRouterSem ? undefined : incomingSem
+  const aps = routers.filter((r) => r.roleBadge !== 'SW' && !rootIds.has(r.id))
   const switches = routers.filter((r) => r.roleBadge === 'SW')
 
+  const suffix = (value: string) => {
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(value.trim())) return ''
+    const parts = value.toLowerCase().replace(/\.$/, '').split('.')
+    return parts.length >= 3 ? parts.slice(1).join('.') : ''
+  }
+  const parentOf = (router: Router): string | undefined => {
+    if (sem?.routerParents) return sem.routerParents[router.id]
+    const exact = devices.filter((d) => rootIds.has(d.routerId) &&
+      ((router.mac && router.mac.toLowerCase() === d.mac.toLowerCase()) ||
+        router.ip.toLowerCase() === d.ip.toLowerCase() || router.ip.toLowerCase() === d.name.toLowerCase() ||
+        router.name.toLowerCase() === d.name.toLowerCase()))
+    const exactRoots = [...new Set(exact.map((d) => d.routerId))]
+    if (exactRoots.length === 1) return exactRoots[0]
+    const site = suffix(router.ip) || suffix(router.name)
+    const siteRoots = roots.filter((r) => site && site === (suffix(r.ip) || suffix(r.name)))
+    if (siteRoots.length === 1) return siteRoots[0]!.id
+    const shortName = router.ip.toLowerCase().split('.')[0]
+    if (suffix(router.ip) && shortName) {
+      const namedRoots = [...new Set(devices.filter((d) => rootIds.has(d.routerId) && d.name.toLowerCase() === shortName).map((d) => d.routerId))]
+      if (namedRoots.length === 1) return namedRoots[0]
+    }
+    return roots.length === 1 ? roots[0]!.id : undefined
+  }
+  const parentById = new Map([...aps, ...switches].map((r) => [r.id, parentOf(r)]))
+
   const gatewayNode: RouterNode | null = gateway
-    ? { kind: 'router', id: gateway.id, router: gateway, ...GATEWAY_COORD }
+    ? { kind: 'router', id: gateway.id, router: gateway, ...GATEWAY_COORD,
+        x: roots.length > 1 ? Math.round(VB_W / (roots.length + 1)) : GATEWAY_COORD.x,
+        label: roots.length > 1
+          ? { x: Math.round(VB_W / (roots.length + 1)), y: GATEWAY_COORD.y + 62, anchor: 'middle' as const }
+          : GATEWAY_COORD.label }
     : null
-  const internetNode = { id: 'internet' as const, ...INTERNET_COORD, r: 42 }
-  const apNodes: RouterNode[] = aps.map((router, i) => ({ kind: 'router', id: router.id, router, ...apCoords(i, aps.length) }))
+  const secondaryNodes: RouterNode[] = secondary.map((router, i) => {
+    const x = Math.round(((i + 2) * VB_W) / (roots.length + 1))
+    return { kind: 'router', id: router.id, router, x, y: GATEWAY_COORD.y, r: GATEWAY_COORD.r,
+      label: { x, y: GATEWAY_COORD.y + 62, anchor: 'middle' as const } }
+  })
+  const rootNodeById = new Map([...(gatewayNode ? [gatewayNode] : []), ...secondaryNodes].map((n) => [n.id, n]))
+  const internetNodes: InternetNode[] = [...rootNodeById.values()].map((root) => ({
+    id: roots.length > 1 ? `internet-${root.id}` : 'internet',
+    routerId: root.id,
+    router: root.router,
+    wan: root.id === gatewayNode?.id ? wan : routerWans[root.id] ?? {},
+    x: roots.length > 1 ? root.x : INTERNET_COORD.x,
+    y: roots.length > 1 ? 85 : INTERNET_COORD.y,
+    r: 42,
+  }))
+  const internetByRouter = new Map(internetNodes.map((node) => [node.routerId, node]))
+  const internetNode = internetNodes[0] ?? { id: 'internet', ...INTERNET_COORD, r: 42 }
+  const apNodes: RouterNode[] = aps.map((router, i) => {
+    if (roots.length === 1) return { kind: 'router', id: router.id, router, ...apCoords(i, aps.length) }
+    const parent = rootNodeById.get(parentById.get(router.id) ?? '')
+    const siblings = aps.filter((ap) => parentById.get(ap.id) === parent?.id)
+    const index = siblings.findIndex((ap) => ap.id === router.id)
+    const parentIndex = roots.findIndex((root) => root.id === parent?.id)
+    const start = roots.length === 2 && parentIndex === 0 ? 55 : 30
+    const end = roots.length === 2 && parentIndex === 0 ? 150 : roots.length === 2 ? 125 : 150
+    const angle = siblings.length <= 1 ? 90 : start + ((end - start) * index) / (siblings.length - 1)
+    const x = parent ? Math.round(parent.x + 205 * Math.cos(rad(angle))) : 100 + (i % 5) * 185
+    const y = parent ? Math.round(parent.y + 245 * Math.sin(rad(angle))) : 710
+    const parts = router.name.split('.')
+    const displayName = parts.length >= 3 ? parts.slice(0, 2).join('.') : router.name
+    return { kind: 'router', id: router.id, router, displayName, x, y, r: AP_RADIUS,
+      label: { x, y: y + AP_RADIUS + 20, anchor: 'middle' as const } }
+  })
   // Switches gestionados: REFACTOR PORTABLE (9-Ago-2026).
   // Se colocan en el HUECO ANGULAR MÁS GRANDE alrededor del gateway (lejos de
   // los APs y del Internet), apilados radialmente. Antes se fijaban en una
@@ -668,7 +761,16 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
       label: { x: isLeft ? x - 34 : x + 34, y: y - 6, anchor: isLeft ? 'end' as const : 'start' as const },
     }
   })
-  const routerNodes: RouterNode[] = gatewayNode ? [gatewayNode, ...apNodes, ...switchNodes] : [...apNodes, ...switchNodes]
+  if (roots.length > 1) {
+    for (const node of switchNodes) {
+      const parent = rootNodeById.get(parentById.get(node.id) ?? '')
+      if (!parent) continue
+      node.x = parent.x + 165
+      node.y = parent.y - 95
+      node.label = { x: node.x + 34, y: node.y - 6, anchor: 'start' }
+    }
+  }
+  const routerNodes: RouterNode[] = gatewayNode ? [gatewayNode, ...secondaryNodes, ...apNodes, ...switchNodes] : [...secondaryNodes, ...apNodes, ...switchNodes]
   const routerById = new Map(routerNodes.map((n) => [n.id, n]))
 
   // -- layout personalizado (issue #656): nodos router ------------------------
@@ -683,6 +785,10 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
       if (!p) continue
       rn.x = p.x
       rn.y = p.y
+      if (roots.length > 1 && (rootIds.has(rn.id) || rn.router.roleBadge !== 'SW')) {
+        rn.label = { x: rn.x, y: rn.y + rn.r + 22, anchor: 'middle' }
+        continue
+      }
       const isLeft = rn.x < (gatewayNode?.x ?? 500)
       rn.label = {
         x: isLeft ? rn.x - rn.r - 6 : rn.x + rn.r + 6,
@@ -690,6 +796,9 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
         anchor: isLeft ? ('end' as const) : ('start' as const),
       }
     }
+  }
+  if (roots.length > 1) {
+    for (const node of internetNodes) node.x = rootNodeById.get(node.routerId)!.x
   }
 
   // D1: el switch gestionado existe como Device Y como distnode managed, pero
@@ -709,7 +818,6 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
     if (d.attachTo && (routerById.has(d.attachTo) || distById.has(d.attachTo) || deviceById.has(d.attachTo))) {
       return d.attachTo
     }
-    if (isWired(d) && !d.port && gatewayNode) return gatewayNode.id
     return d.routerId
   }
   // SPEC-65 D65-3/D65-9 B2: con semántica server-side, los anillos llegan
@@ -725,7 +833,7 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
     for (const node of routerNodes) {
       const ring = sem.rings[node.id] ?? []
       ringOrder.set(node.id, ring)
-      const cap = node.id === gatewayNode?.id ? GW_RING_VISIBLE : AP_RING_VISIBLE
+      const cap = rootIds.has(node.id) ? GW_RING_VISIBLE : AP_RING_VISIBLE
       ringVisible.set(node.id, new Set(ring.slice(0, cap)))
       const hidden = sem.hiddenPeers?.[node.id] ?? 0
       if (hidden > 0) ringOverflow.set(node.id, hidden)
@@ -768,7 +876,7 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
   }
 
   for (const node of routerNodes) {
-    const isGw = node.id === gatewayNode?.id
+    const isGw = rootIds.has(node.id)
     // Los distnodes inferidos y gestionados (LLDP) son anchors propios; el
     // hipervisor se posiciona vía su device host (hub), el distnode solo
     // aporta metadatos (puerto, macCount).
@@ -825,7 +933,8 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
       // Vecinos desde los que alejarse: gateway, los distnodes del switch/AP y
       // los demás routers (APs/switches) — el host se abre paso en el hueco.
       const neighbors: { x: number; y: number }[] = []
-      if (gatewayNode) neighbors.push(gatewayNode)
+      const parent = rootNodeById.get(parentById.get(node.id) ?? '')
+      if (parent) neighbors.push(parent)
       for (const other of routerNodes) {
         if (other.id !== node.id) neighbors.push(other)
       }
@@ -835,8 +944,8 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
       // gateway y el fan cableado), donde este router no tiene clientes (issue
       // #141). En su interior se elige el hueco angular más grande.
       const hostArcs: [number, number][] = []
-      if (gatewayNode) {
-        hostArcs.push(...arcAround(angleTo(node.x, node.y, gatewayNode.x, gatewayNode.y), 27))
+      if (parent) {
+        hostArcs.push(...arcAround(angleTo(node.x, node.y, parent.x, parent.y), 27))
       }
       hostArcs.push([AP_WIRED_FAN[0] - 10, AP_WIRED_FAN[1] + 10])
       const gapAngle = widestGapCenterInArcs(node, neighbors, HUB_HOST_RADIUS, hostArcs)
@@ -918,7 +1027,7 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
   // wifi: anillos con arcos prohibidos (uplink, etiqueta, WAN, fan cableado)
   const ringRadii = new Map<string, number[]>()
   for (const node of routerNodes) {
-    const isGw = node.id === gatewayNode?.id
+    const isGw = rootIds.has(node.id)
     const wifi = childrenOf(node.id)
       .filter((d) => !isWired(d) && isVisibleInRing(d))
       .map((d) => mkChip(d, node.id))
@@ -929,13 +1038,14 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
       // gateway y su halo ocupa ±35°; sin esto un chip del anillo exterior
       // quedaría a ~80px del icono).
       excludes.push(...arcAround(270, 35))
-      if (gatewayNode) excludes.push(...arcAround(angleTo(gatewayNode.x, gatewayNode.y, gatewayNode.label.x, gatewayNode.label.y), 22))
-      for (const ap of apNodes) excludes.push(...arcAround(angleTo(node.x, node.y, ap.x, ap.y), 15))
+      excludes.push(...arcAround(angleTo(node.x, node.y, node.label.x, node.label.y), 22))
+      for (const ap of apNodes.filter((ap) => parentById.get(ap.id) === node.id)) excludes.push(...arcAround(angleTo(node.x, node.y, ap.x, ap.y), 15))
       // switches gestionados: ahora al NW del gateway; sin este exclude los
       // chips wifi del anillo externo (r=190) caerían encima del icono del switch.
-      for (const sw of switchNodes) excludes.push(...arcAround(angleTo(node.x, node.y, sw.x, sw.y), 20))
+      for (const sw of switchNodes.filter((sw) => parentById.get(sw.id) === node.id)) excludes.push(...arcAround(angleTo(node.x, node.y, sw.x, sw.y), 20))
     } else {
-      if (gatewayNode) excludes.push(...arcAround(angleTo(node.x, node.y, gatewayNode.x, gatewayNode.y), 27))
+      const parent = rootNodeById.get(parentById.get(node.id) ?? '')
+      if (parent) excludes.push(...arcAround(angleTo(node.x, node.y, parent.x, parent.y), 27))
       excludes.push(...arcAround(angleTo(node.x, node.y, node.label.x, node.label.y), 22))
     }
     excludes.push(...(fanArcByRouter.get(node.id) ?? []))
@@ -967,7 +1077,7 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
     // Conocido su radio wifi real, se reposicionan los APs y switches a partir
     // del BORDE del círculo (radio + margen), de modo que ningún AP/switch
     // invada la zona de los clientes wifi del gateway. Internet también se aleja.
-    if (isGw && gatewayNode) {
+    if (node.id === gatewayNode?.id && gatewayNode) {
       // El círculo virtual usa el radio del anillo wifi BASE del gateway (el
       // anillo exterior canónico), no el radio real con anillos extra — los
       // anillos extra solo crecen en arcos libres parciales, no alrededor de
@@ -979,7 +1089,7 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
       const clearDist = Math.max(baseMax, Math.min(gwRingRadius, baseMax + 80)) + 36
       // Internet: sobre el gateway (misma x), empujado hacia arriba del viewport.
       const targetY = Math.max(24, gatewayNode.y - clearDist)
-      internetNode.y = targetY
+      if (roots.length === 1) internetNode.y = targetY
       // APs y switches: a lo largo del vector desde el gateway hasta su posición
       // canónica, empujados hasta quedar a >= clearDist (fuera del círculo).
       const pushOut = (rn: RouterNode) => {
@@ -998,8 +1108,8 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
         rn.label.y = rn.y - 6
         rn.label.anchor = isLeft ? 'end' as const : 'start' as const
       }
-      for (const ap of apNodes) pushOut(ap)
-      for (const sw of switchNodes) pushOut(sw)
+      for (const ap of apNodes.filter((ap) => parentById.get(ap.id) === gatewayNode.id)) pushOut(ap)
+      for (const sw of switchNodes.filter((sw) => parentById.get(sw.id) === gatewayNode.id)) pushOut(sw)
     }
   }
 
@@ -1145,7 +1255,7 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
     const node = routerById.get(routerId)
     if (!node) continue
     const radii = ringRadii.get(routerId)
-    const isGw = routerId === gatewayNode?.id
+    const isGw = rootIds.has(routerId)
     const r = radii?.[radii.length - 1] ?? (isGw ? GATEWAY_RINGS : AP_RINGS)[(isGw ? GATEWAY_RINGS : AP_RINGS).length - 1]!.r
     // Clientes ocultos = miembros del anillo que exceden el aforo visible
     // (issue #117: el chip "+N" los lista al hacer clic, como peers-overflow).
@@ -1153,15 +1263,28 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
     ringOverflowChips.push({ routerId, count, devices: hidden, ...pos(node.x, node.y, isGw ? 60 : 250, r) })
   }
 
-  // -- peers WireGuard (arriba; túnel trazado vía Internet) -------------------
+  // -- peers WireGuard (peer remoto compartido; cada router conserva su edge) -
   // Hay 4 coordenadas canónicas: los activos que exceden se agrupan en el
   // chip "+N" (antes se descartaban silenciosamente).
-  const activePeers = wireguard.peers.filter((p) => p.active)
+  const multiWireGuard = roots.length > 1 && (wireguards?.length ?? 0) > 1
+  const peerId = (routerId: string, peer: WGPeer) => peer.keyFingerprint
+    ? `peer-key-${peer.keyFingerprint}` : `peer-${routerId}-${peer.id}`
+  const peerById = new Map<string, WGPeer>()
+  if (multiWireGuard) {
+    for (const rw of wireguards ?? []) {
+      for (const peer of rw.stats.peers) {
+        const id = peerId(rw.routerId, peer)
+        if (!peerById.has(id) || peer.active) peerById.set(id, peer)
+      }
+    }
+  }
+  const activePeers = multiWireGuard ? [...peerById.values()] : wireguard.peers.filter((p) => p.active)
+  const peerIds = multiWireGuard ? [...peerById.keys()] : activePeers.map((p) => `peer-${p.id}`)
   const peerNodes: PeerNode[] = activePeers.slice(0, PEER_COORDS.length).map((peer, i) => ({
     kind: 'peer',
-    id: `peer-${peer.id}`,
+    id: peerIds[i]!,
     peer,
-    ...PEER_COORDS[i]!,
+    ...(multiWireGuard ? MULTI_PEER_COORDS[i]! : PEER_COORDS[i]!),
   }))
   const hiddenPeers = activePeers.slice(PEER_COORDS.length)
 
@@ -1190,19 +1313,30 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
 
   // -- enlaces -----------------------------------------------------------------
   const links: TopoLink[] = []
-  if (gatewayNode) {
+  const multiWgPath = (root: RouterNode, peer: PeerNode): string => {
+    const peerEdgeX = peer.x + (root.x < peer.x ? -18 : 18)
+    const edge = pos(root.x, root.y, angleTo(root.x, root.y, peerEdgeX, peer.y), root.r + 2)
+    return `M ${edge.x} ${edge.y} Q ${(edge.x + peerEdgeX) / 2} ${Math.min(edge.y, peer.y) - 25}, ${peerEdgeX} ${peer.y}`
+  }
+  for (const root of rootNodeById.values()) {
+    const rootInternet = internetByRouter.get(root.id)!
     // WAN Internet→gateway: path DINÁMICO desde el borde del icono de Internet
     // hasta el borde del gateway (antes estaba hardcodeado a la posición vieja
     // de Internet y quedaba colgando al moverlo).
-    const wanEdge = pos(internetNode.x, internetNode.y, 90, internetNode.r + 4)
-    const gwTop = { x: gatewayNode.x, y: gatewayNode.y - gatewayNode.r }
+    const wanEdge = pos(rootInternet.x, rootInternet.y, angleTo(rootInternet.x, rootInternet.y, root.x, root.y), rootInternet.r + 4)
+    const gwTop = { x: root.x, y: root.y - root.r }
     const d = `M ${wanEdge.x} ${wanEdge.y} C ${wanEdge.x} ${(wanEdge.y + gwTop.y) / 2}, ${gwTop.x} ${(wanEdge.y + gwTop.y) / 2}, ${gwTop.x} ${gwTop.y}`
+    const isPrimary = root.id === gatewayNode?.id
+    const routerWan = routerWans[root.id]
     links.push({
-      id: 'wan', kind: 'wan',
+      id: isPrimary ? 'wan' : `wan-${root.id}`, kind: 'wan',
       d,
-      lx: 518, ly: Math.round((wanEdge.y + gwTop.y) / 2), label: `Fibra ${wan.plan} · ${wan.latencyMs} ms`,
-      width: 3, ...flowFor(600),
-      from: 'internet', to: gatewayNode.id,
+      lx: root.x + 18, ly: Math.round((wanEdge.y + gwTop.y) / 2),
+      label: isPrimary ? `Fibra ${wan.plan} · ${wan.latencyMs} ms`
+        : routerWan?.latencyMs != null ? `WAN · ${routerWan.latencyMs} ms` : 'WAN',
+      width: 3, ...flowFor(root.router.status === 'offline' ? 0 : isPrimary ? 600 : routerWan?.downMbps ?? 0, isPrimary && root.router.status !== 'offline'),
+      active: root.router.status !== 'offline',
+      from: rootInternet.id, to: root.id,
     })
   }
   const makeUplink = (node: RouterNode) => {
@@ -1214,7 +1348,8 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
       : isSwitch
         ? `Switch ${node.router.name}${node.router.lldp ? ' · LLDP' : ''}`
         : `Cable 1G${node.router.lldp ? ' · LLDP' : ''}`
-    const from = gatewayNode ?? null
+    const from = rootNodeById.get(parentById.get(node.id) ?? '') ?? null
+    if (!from) return
     let d = ''
     let lx = 0, ly = 0
     if (from) {
@@ -1230,7 +1365,7 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
       d, lx, ly,
       label,
       width: isSwitch ? 2 : isWifi ? 2 : 3, ...flowFor(Math.max(traffic, isWifi ? 40 : isSwitch ? 60 : 120)),
-      from: from?.id ?? 'internet', to: node.id,
+      from: from.id, to: node.id,
     })
   }
   apNodes.forEach(makeUplink)
@@ -1296,15 +1431,35 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
       })
     }
   }
-  peerNodes.forEach((node, i) => {
-    const d = `M ${node.x + 7} ${node.y + 18} C ${node.x + 60} ${node.y + 56}, ${internetNode.x - 40} ${internetNode.y + 36}, ${internetNode.x - 26} ${internetNode.y + 22}`
-    links.push({
-      id: `wg-${node.peer.id}`, kind: 'wg',
-      d, lx: 0, ly: 0, label: '',
-      width: 2, packets: 1, packetDur: WG_DURS[i] ?? 3.2,
-      from: node.id, to: 'internet',
+  if (multiWireGuard) {
+    for (const rw of wireguards ?? []) {
+      const root = rootNodeById.get(rw.routerId)
+      if (!root) continue
+      for (const peer of rw.stats.peers) {
+        const node = peerNodes.find((n) => n.id === peerId(rw.routerId, peer))
+        if (!node) continue
+        const interfaceName = peer.interface || rw.stats.interface || 'wg'
+        const active = rw.stats.status === 'active' && peer.active
+        links.push({
+          id: `wg-${rw.routerId}-${interfaceName}-${node.id}`, kind: 'wg', interface: peer.interface,
+          d: multiWgPath(root, node),
+          lx: 0, ly: 0, label: '', width: 2,
+          packets: active ? 1 : 0, packetDur: 3.2, active,
+          from: root.id, to: node.id,
+        })
+      }
+    }
+  } else {
+    peerNodes.forEach((node, i) => {
+      const d = `M ${node.x + 7} ${node.y + 18} C ${node.x + 60} ${node.y + 56}, ${internetNode.x - 40} ${internetNode.y + 36}, ${internetNode.x - 26} ${internetNode.y + 22}`
+      links.push({
+        id: `wg-${node.peer.id}`, kind: 'wg',
+        d, lx: 0, ly: 0, label: '',
+        width: 2, packets: 1, packetDur: WG_DURS[i] ?? 3.2,
+        from: node.id, to: 'internet',
+      })
     })
-  })
+  }
 
   // SPEC-65 D65-3/D65-9 B2: con semántica server-side, la LISTA de enlaces
   // (from/to/kind) la manda el servidor; aquí solo se asigna la geometría
@@ -1323,13 +1478,19 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
       }
       switch (sl.kind) {
         case 'wan': {
-          if (!gatewayNode || sl.to !== gatewayNode.id) return null
+          const root = rootNodeById.get(sl.to)
+          if (!root) return null
+          const rootInternet = internetByRouter.get(root.id)
+          if (!rootInternet) return null
+          const info = routerWans[root.id]
           return {
-            id: 'wan', kind: 'wan',
-            d: 'M 500 92 C 500 122, 500 162, 500 208',
-            lx: 518, ly: 162, label: `Fibra ${wan.plan} · ${wan.latencyMs} ms`,
-            width: 3, ...flowFor(600),
-            from: sl.from, to: sl.to,
+            id: root.id === gatewayNode?.id ? 'wan' : `wan-${root.id}`, kind: 'wan',
+            d: curve(rootInternet, root),
+            lx: root.x + 18, ly: (rootInternet.y + root.y) / 2,
+            label: root.id === gatewayNode?.id ? `Fibra ${wan.plan} · ${wan.latencyMs} ms` : info?.latencyMs != null ? `WAN · ${info.latencyMs} ms` : 'WAN',
+            width: 3, ...flowFor(root.router.status === 'offline' ? 0 : root.id === gatewayNode?.id ? 600 : info?.downMbps ?? 0),
+            active: root.router.status !== 'offline',
+            from: rootInternet.id, to: sl.to,
           }
         }
         case 'uplink': {
@@ -1338,7 +1499,7 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
           if (!node) return null
           const isWifi = node.router.backhaul === 'wifi'
           const label = isWifi ? 'WiFi uplink' : `Cable 1G${node.router.lldp ? ' · LLDP' : ''}`
-          const from = gatewayNode ?? null
+          const from = routerById.get(sl.from) ?? null
           const d = from ? curve(from, node) : ''
           return {
             id: `uplink-${node.id}`, kind: 'uplink', wifi: isWifi,
@@ -1377,11 +1538,16 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
           }
         }
         case 'wg': {
-          const pn = peerNodes.find((p) => p.id === sl.from)
+          const pn = peerNodes.find((p) => p.id === (multiWireGuard ? sl.to : sl.from))
           if (!pn) return null
-          const d = `M ${pn.x + 7} ${pn.y + 18} C ${pn.x + 60} ${pn.y + 56}, ${internetNode.x - 40} ${internetNode.y + 36}, ${internetNode.x - 26} ${internetNode.y + 22}`
+          const root = rootNodeById.get(sl.from)
+          if (multiWireGuard && !root) return null
+          const d = root
+            ? multiWgPath(root, pn)
+            : `M ${pn.x + 7} ${pn.y + 18} C ${pn.x + 60} ${pn.y + 56}, ${internetNode.x - 40} ${internetNode.y + 36}, ${internetNode.x - 26} ${internetNode.y + 22}`
           return {
-            id: `wg-${pn.peer.id}`, kind: 'wg',
+            id: root ? `wg-${root.id}-${sl.interface || 'wg'}-${pn.id}` : `wg-${pn.peer.id}`,
+            kind: 'wg', interface: sl.interface,
             d, lx: 0, ly: 0, label: '',
             width: 2, packets: 1, packetDur: WG_DURS[wgIdx] ?? 3.2,
             from: sl.from, to: sl.to,
@@ -1389,11 +1555,17 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
         }
       }
     }
-    const derivedByKey = new Map(links.map((l) => [`${l.kind}|${l.from}|${l.to}`, l] as const))
+    const linkKey = (l: Pick<TopoLink, 'kind' | 'from' | 'to' | 'interface'>) =>
+      `${l.kind}|${l.from}|${l.to}|${l.interface ?? ''}`
+    const derivedByKey = new Map(links.map((l) => [linkKey(l), l] as const))
     const semLinks: TopoLink[] = []
     let wgIdx = 0
     for (const sl of sem.links) {
-      const key = `${sl.kind}|${sl.from}|${sl.to}` as const
+      // Older servers still use one semantic "internet" ID for every WAN.
+      // The router identity determines the actual endpoint in the map.
+      const normalized = sl.kind === 'wan' && internetByRouter.has(sl.to)
+        ? { ...sl, from: internetByRouter.get(sl.to)!.id } : sl
+      const key = linkKey(normalized)
       const hit = derivedByKey.get(key)
       if (hit) {
         semLinks.push(hit)
@@ -1401,7 +1573,7 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
         if (sl.kind === 'wg') wgIdx++
         continue
       }
-      const gen = semLinkGeometry(sl, sl.kind === 'wg' ? wgIdx++ : 0)
+      const gen = semLinkGeometry(normalized, sl.kind === 'wg' ? wgIdx++ : 0)
       if (gen) semLinks.push(gen)
     }
     links.length = 0
@@ -1435,18 +1607,25 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
 
   // Tabla de backhauls (topology.md §④)
   const backhauls: BackhaulRow[] = []
-  if (gatewayNode) {
+  for (const root of rootNodeById.values()) {
+    const isPrimary = root.id === gatewayNode?.id
+    const info = routerWans[root.id]
     backhauls.push({
-      id: 'wan', a: 'Gateway', b: 'Internet', kind: 'wan',
-      type: 'topology.links.fiberWan', speed: wan.plan, signal: `${wan.latencyMs} ms`,
-      tone: 'ok', statusLabel: 'common.status.online',
-      spark: gatewayNode.router.sparkline, sparkColor: COLOR.accent,
+      id: isPrimary ? 'wan' : `wan-${root.id}`, a: root.router.name, b: 'Internet', kind: 'wan',
+      type: isPrimary ? 'topology.links.fiberWan' : 'WAN',
+      speed: isPrimary ? wan.plan : info?.downMbps != null ? `${info.downMbps} Mbps` : '—',
+      signal: isPrimary ? `${wan.latencyMs} ms` : info?.latencyMs != null ? `${info.latencyMs} ms` : '—',
+      tone: root.router.status === 'offline' ? 'warn' : 'ok',
+      statusLabel: root.router.status === 'offline' ? 'common.status.offline' : 'common.status.online',
+      spark: root.router.sparkline, sparkColor: COLOR.accent,
     })
   }
   for (const node of apNodes) {
+    const parent = rootNodeById.get(parentById.get(node.id) ?? '')
+    if (!parent) continue
     const isWifi = node.router.backhaul === 'wifi'
     backhauls.push({
-      id: `uplink-${node.id}`, a: 'Gateway', b: node.router.name, kind: 'uplink',
+      id: `uplink-${node.id}`, a: parent.router.name, b: node.router.name, kind: 'uplink',
       type: isWifi ? 'topology.links.wifiUplink' : 'common.cable',
       speed: isWifi ? '866 Mbps PHY' : '1 Gbps',
       signal: isWifi ? '−58 dBm · 1 ms' : '<1 ms',
@@ -1499,13 +1678,17 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
       spark: host.sparkline, sparkColor: COLOR.ok,
     })
   }
-  // La tabla canónica muestra un único túnel (el más reciente)
-  for (const node of peerNodes.slice(0, 1)) {
+  // Each router's tunnel is a separate row even when the remote peer is shared.
+  for (const link of links.filter((l) => l.kind === 'wg')) {
+    const node = peerNodes.find((p) => p.id === (multiWireGuard ? link.to : link.from))
+    if (!node) continue
     const device = devices.find((d) => d.id === node.peer.id)
     backhauls.push({
-      id: `wg-${node.peer.id}`, a: 'Internet', b: node.peer.name, kind: 'wg',
-      type: 'WireGuard', speed: '—', signal: '42 ms',
-      tone: 'tunnel', statusLabel: 'common.active',
+      id: link.id, a: multiWireGuard ? (routerById.get(link.from)?.router.name ?? link.from) : 'Internet',
+      b: node.peer.name, kind: 'wg',
+      type: 'WireGuard', speed: '—', signal: '—',
+      tone: link.active === false ? 'warn' : 'tunnel',
+      statusLabel: link.active === false ? 'common.status.offline' : 'common.active',
       spark: device?.sparkline ?? [0, 0], sparkColor: COLOR.tunnel,
     })
   }
@@ -1554,9 +1737,10 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
       : routerById.get(dn.node.routerId)
     if (from) repelSegments.push({ x1: from.x, y1: from.y, x2: dn.x, y2: dn.y })
   }
-  for (const rn of routerNodes) {
-    if (rn.id === gatewayNode?.id || !gatewayNode) continue
-    repelSegments.push({ x1: gatewayNode.x, y1: gatewayNode.y, x2: rn.x, y2: rn.y })
+  for (const rn of [...apNodes, ...switchNodes]) {
+    const parent = rootNodeById.get(parentById.get(rn.id) ?? '')
+    if (!parent) continue
+    repelSegments.push({ x1: parent.x, y1: parent.y, x2: rn.x, y2: rn.y })
   }
 
   // --- Resolución de colisiones ---
@@ -1568,8 +1752,8 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
   // quedar pegado al borde de un router/distnode/Internet — mínimo
   // r_nodo + r_chip + margin + padding. El gateway (r40) usa margen mayor.
   const collidables: { x: number; y: number; r: number; fixed?: boolean; margin?: number; hubX?: number; hubY?: number; restDist?: number; id?: string }[] = [
-    ...routerNodes.map((rn) => ({ x: rn.x, y: rn.y, r: rn.r, fixed: true, margin: rn.id === gatewayNode?.id ? 40 : 26 })),
-    { x: internetNode.x, y: internetNode.y, r: 30, fixed: true, margin: 30 },
+    ...routerNodes.map((rn) => ({ x: rn.x, y: rn.y, r: rn.r, fixed: true, margin: rootIds.has(rn.id) ? 40 : 26 })),
+    ...internetNodes.map((node) => ({ x: node.x, y: node.y, r: 30, fixed: true, margin: 30 })),
   ]
   // chips: buscar coords del hub padre
   for (const c of chips) {
@@ -1595,14 +1779,15 @@ export function buildTopologyModel({ routers, devices, wan, wireguard, distribut
   }
   resolveCollisions(collidables, 80, 14, repelSegments)
   // Escribir posiciones de vuelta (solo chips; routers y distnodes son fixed)
-  let ci = routerNodes.length + 1 // +1 = Internet (añadido tras los routers)
+  let ci = routerNodes.length + internetNodes.length
   for (const c of chips) { const ref = collidables[ci]!; c.x = ref.x; c.y = ref.y; ci++ }
 
   return {
     gatewayNode,
+    secondaryNodes,
     apNodes,
     routerNodes,
-    internetNode,
+    internetNodes,
     peerNodes,
     hiddenPeers,
     chips,

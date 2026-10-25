@@ -63,6 +63,25 @@ func TestInferTopologySwitchInferido(t *testing.T) {
 	}
 }
 
+func TestInferTopologySecondaryRouterCanAnchorDistribution(t *testing.T) {
+	polled := map[string]*routerPolled{
+		"router-a": {cfg: RouterConfig{ID: "router-a", IsGateway: true}, fdb: map[string]string{}},
+		"router-b": {cfg: RouterConfig{ID: "router-b", IsRouter: true}, fdb: map[string]string{
+			"78:2B:CB:AA:01:01": "eth2", "8C:EA:48:AA:02:02": "eth2",
+		}},
+	}
+	devices := []Device{dev("78:2B:CB:AA:01:01", "router-b", "cable"), dev("8C:EA:48:AA:02:02", "router-b", "cable")}
+	devices, dists := inferTopology(polled, devices)
+	if len(dists) != 1 || dists[0].RouterID != "router-b" || dists[0].Kind != "inferred" {
+		t.Fatalf("secondary distribution: %+v", dists)
+	}
+	for _, device := range devices {
+		if device.AttachTo != dists[0].ID {
+			t.Errorf("%s attached to %q", device.ID, device.AttachTo)
+		}
+	}
+}
+
 func TestInferTopologyHipervisor(t *testing.T) {
 	polled := polledWithFDB("flint2", "94:83:C4:00:00:01", map[string]string{
 		"3C:52:82:10:20:30": "lan2", // host (OUI normal)

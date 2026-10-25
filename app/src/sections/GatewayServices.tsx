@@ -11,6 +11,7 @@ import { CountUp } from '@/components/CountUp'
 import { ServicePanel } from '@/components/ServicePanel'
 import { StatusPill } from '@/components/StatusPill'
 import { useDashboard } from '@/hooks/useDashboard'
+import type { WireGuardGroup, WireGuardMember } from './wireguardGroups'
 
 // ---------------------------------------------------------------------------
 // Mini donut AdGuard (88px): bloqueado emerald vs permitido --border
@@ -56,13 +57,13 @@ const PEER_ICONS: Record<PeerType, LucideIcon> = {
   desconocido: Waypoints,
 }
 
-function PeerRow({ peer, index }: { peer: WGPeer; index: number }) {
+function PeerRow({ peer, index, label, interfaceName, routerId }: { peer: WGPeer; index: number; label?: string; interfaceName?: string; routerId?: string }) {
   const { t } = useTranslation()
   // #592: el servidor puede enviar un tipo no mapeado ("desconocido"/otro);
   // sin fallback el <Icon/> sería undefined y React crasheaba ("Element type
   // is invalid") con un cliente WireGuard activo, dejando la UI en negro.
   const Icon = PEER_ICONS[peer.type] ?? Waypoints
-  return (
+  const content = (
     <motion.div
       initial={{ opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
@@ -70,22 +71,23 @@ function PeerRow({ peer, index }: { peer: WGPeer; index: number }) {
       className="flex items-center gap-3 rounded-xl px-2 py-2 transition-colors hover:bg-hover"
     >
       <span className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-tunnel/10 font-display text-sm font-semibold text-tunnel">
-        {peer.name.charAt(0)}
+        {(label ?? peer.name).charAt(0)}
         <Icon className="absolute -bottom-0.5 -right-0.5 h-3.5 w-3.5 rounded-full bg-surface p-0.5 text-text-secondary" strokeWidth={1.75} />
       </span>
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-medium text-text-primary">{peer.name}</div>
+        <div className="truncate text-sm font-medium text-text-primary">{label ?? peer.name}</div>
         <div className="flex items-center gap-1.5 text-caption text-text-muted">
           <span className="relative flex h-1.5 w-1.5">
-            <span className="absolute inline-flex h-full w-full rounded-full bg-ok opacity-75 animate-ping-soft" />
-            <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-ok" />
+            {peer.active && <span className="absolute inline-flex h-full w-full rounded-full bg-ok opacity-75 animate-ping-soft" />}
+            <span className={`relative inline-flex h-1.5 w-1.5 rounded-full ${peer.active ? 'bg-ok' : 'bg-text-muted'}`} />
           </span>
-          {t('home.services.handshake', { time: relTime(peer.lastHandshake) })}
+          {interfaceName && `${interfaceName} · `}{t('home.services.handshake', { time: relTime(peer.lastHandshake) })}
         </div>
       </div>
       <span className="shrink-0 font-mono text-mono-sm text-text-secondary">↓ {peer.rx}</span>
     </motion.div>
   )
+  return routerId ? <Link to={`/routers/${routerId}#wireguard`}>{content}</Link> : content
 }
 
 /** ③a Tarjeta AdGuard Home (home.md §③) */
@@ -185,25 +187,25 @@ export function AdGuardCard({ index = 0 }: { index?: number }) {
 }
 
 /** ③b Tarjeta WireGuard (home.md §③) */
-export function WireGuardCard({ index = 1 }: { index?: number }) {
+export function WireGuardCard({ group, index = 1 }: { group: WireGuardGroup; index?: number }) {
   const { t } = useTranslation()
   const { refreshKey } = useDashboard()
-  const { wireguard, routers } = useNetPulse()
-  const gwId = routers.find((r) => r.roleBadge === 'Principal')?.id ?? routers[0]?.id ?? ''
-  const activePeers = wireguard.peers.filter((p) => p.active)
-  const inactivePeers = wireguard.peers.filter((p) => !p.active)
+  const activePeers = group.members.filter((member) => member.peer.active)
+  const inactivePeers = group.members.filter((member) => !member.peer.active)
+  const peerLabel = (member: WireGuardMember) => group.role === 'client' ? member.routerName : member.peer.name
+  const roleLabel = t(group.role === 'client' ? 'home.services.clientInstance' : group.role === 'server' ? 'home.services.serverInstance' : 'home.services.unknownInstance')
 
   return (
       <ServicePanel
         icon={KeyRound}
         tone="tunnel"
-        title="WireGuard"
-        status={<StatusPill tone="tunnel" label={t('home.services.activePeers', { count: activePeers.length })} />}
+        title={group.role === 'client' ? group.title : `WireGuard · ${group.title}`}
+        status={<StatusPill tone={activePeers.length ? 'tunnel' : 'muted'} label={roleLabel} />}
         index={index}
         className="flex-1"
         footer={
           <Link
-            to={`/routers/${gwId}#wireguard`}
+            to={`/routers/${group.routerId}#wireguard`}
             className="group inline-flex items-center gap-1.5 text-caption font-semibold text-text-secondary transition-colors hover:text-tunnel"
           >
             {t('home.services.viewTunnel')}
@@ -214,9 +216,9 @@ export function WireGuardCard({ index = 1 }: { index?: number }) {
         <div className="grid grid-cols-3 gap-3">
           <div>
             <div className="font-mono text-lg font-semibold text-text-primary">
-              <CountUp value={wireguard.peers.length} nonce={refreshKey} />
+              <CountUp value={group.members.length} nonce={refreshKey} />
             </div>
-            <div className="text-caption text-text-muted">{t('home.services.peersConfigured')}</div>
+            <div className="text-caption text-text-muted">{t(group.role === 'client' ? 'home.services.localClients' : 'home.services.peersConfigured')}</div>
           </div>
           <div>
             <div className="font-mono text-lg font-semibold text-ok">
@@ -225,26 +227,27 @@ export function WireGuardCard({ index = 1 }: { index?: number }) {
             <div className="text-caption text-text-muted">{t('home.services.connected')}</div>
           </div>
           <div>
-            <div className="font-mono text-mono-sm font-semibold text-text-primary">{wireguard.subnet}</div>
-            <div className="text-caption text-text-muted">{t('home.services.tunnelIface', { iface: wireguard.interface })}</div>
+            <div className="font-mono text-mono-sm font-semibold text-text-primary">{group.interface}</div>
+            <div className="text-caption text-text-muted">{t(group.role === 'client' ? 'home.services.remoteServer' : 'home.services.tunnelIface', { iface: group.interface })}</div>
           </div>
         </div>
 
         <div className="mt-3 space-y-1">
-          {activePeers.map((p, i) => (
-            <PeerRow key={p.id} peer={p} index={i} />
+          {activePeers.map((member, i) => (
+            <PeerRow key={`${member.routerId}-${member.interface}-${member.peer.id}`} peer={member.peer} index={i}
+              label={peerLabel(member)} interfaceName={member.interface} routerId={member.routerId} />
           ))}
         </div>
 
         <div className="mt-3 flex items-center gap-2.5 px-2">
           <div className="flex -space-x-2">
-            {inactivePeers.map((p) => (
+            {inactivePeers.map((member) => (
               <span
-                key={p.id}
-                title={`${p.name} · ${relTime(p.lastHandshake)}`}
+                key={`${member.routerId}-${member.interface}-${member.peer.id}`}
+                title={`${peerLabel(member)} · ${relTime(member.peer.lastHandshake)}`}
                 className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-surface bg-elevated font-display text-[11px] font-semibold text-text-muted"
               >
-                {p.name.charAt(0)}
+                {peerLabel(member).charAt(0)}
               </span>
             ))}
           </div>

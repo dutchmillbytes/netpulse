@@ -1,10 +1,12 @@
 // wireguard.go — Adapter live para WireGuard (port de
 // src/adapters/wireguard.js, SPEC §7.5): parsea `wg show <iface> dump` vía
-// SSH en el gateway. Quirk preservado: status 'active' siempre que el
+// SSH en cada router supervisado. Quirk preservado: status 'active' siempre que el
 // comando responda (peers.length >= 0 ⇒ true).
 package adapters
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -207,6 +209,83 @@ func parseWGUciDescs(uci string) map[string]string {
 	return out
 }
 
+// parseWGUciPeerRoles uses the configured remote endpoint, not the runtime
+// endpoint from wg dump (which also appears on a server after a handshake).
+func parseWGUciPeerRoles(uci, iface string) map[string]string {
+	type peerConfig struct {
+		kind, publicKey, endpointHost, endpointPort string
+	}
+	sections := map[string]*peerConfig{}
+	for _, line := range strings.Split(uci, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "network.") {
+			continue
+		}
+		path, value, ok := strings.Cut(strings.TrimPrefix(line, "network."), "=")
+		if !ok {
+			continue
+		}
+		value = strings.Trim(value, "'\"")
+		section, field, hasField := strings.Cut(path, ".")
+		cfg := sections[section]
+		if cfg == nil {
+			cfg = &peerConfig{}
+			sections[section] = cfg
+		}
+		if !hasField {
+			cfg.kind = value
+			continue
+		}
+		switch field {
+		case "public_key":
+			cfg.publicKey = value
+		case "endpoint_host":
+			cfg.endpointHost = value
+		case "endpoint_port":
+			cfg.endpointPort = value
+		}
+	}
+	roles := map[string]string{}
+	for _, cfg := range sections {
+		if cfg.kind != "wireguard_"+iface || cfg.publicKey == "" {
+			continue
+		}
+		role := "server"
+		if cfg.endpointHost != "" || cfg.endpointPort != "" {
+			role = "client"
+		}
+		roles[cfg.publicKey] = role
+	}
+	return roles
+}
+
+func wgInstanceRole(peers []WGPeer) string {
+	if len(peers) == 0 {
+		return "unknown"
+	}
+	client, server, unknown := false, false, false
+	for _, peer := range peers {
+		switch peer.LocalRole {
+		case "client":
+			client = true
+		case "server":
+			server = true
+		default:
+			unknown = true
+		}
+	}
+	if unknown {
+		return "unknown"
+	}
+	if client && server {
+		return "mixed"
+	}
+	if client {
+		return "client"
+	}
+	return "server"
+}
+
 // buildWGPeer convierte un peer del dump en un WGPeer, resolviendo el nombre
 // con la prioridad de siempre (nombre de device NetPulse → description UCI →
 // tunnelIP → "Peer <pubkey8>", issue #659) y asignando el fallback de ID
@@ -248,13 +327,23 @@ func buildWGPeer(p WGDumpPeer, peerNames map[string]WGPeerName, descs map[string
 		lastHandshake = relTime(p.HandshakeSec, nowSec)
 	}
 	return WGPeer{
-		ID: id, Name: name, Type: typ, TunnelIP: tunnelIP,
+		ID: id, KeyFingerprint: peerKeyFingerprint(p.Pubkey), Name: name, Type: typ, TunnelIP: tunnelIP,
 		Active: active, LastHandshake: lastHandshake,
 		Rx: fmtBytes(float64(p.RxBytes)), Tx: fmtBytes(float64(p.TxBytes)),
 	}
 }
 
-// GetWireGuardStats obtiene WireGuardStats del gateway vía SSH, agregando los
+// peerKeyFingerprint is a stable, opaque identity for the remote endpoint.
+// Peer IDs, names and allowed IPs are local to a router and cannot merge peers.
+func peerKeyFingerprint(publicKey string) string {
+	if publicKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(publicKey))
+	return hex.EncodeToString(sum[:8])
+}
+
+// GetWireGuardStats obtiene WireGuardStats de un router vía SSH, agregando los
 // peers de TODAS las interfaces WireGuard del router (issue #713).
 // iface: filtro/override de interfaces a sondear ("auto"/vacío → descubrir
 // todas con `wg show interfaces`; valor → interfaz o lista separada por
@@ -274,6 +363,7 @@ func GetWireGuardStats(pool sshRunner, host, iface, subnet string, peerNames map
 		Subnet:    subnet,
 		Status:    "active", // quirk: siempre que el comando responda
 		Peers:     []WGPeer{},
+		Instances: []WireGuardInstance{},
 	}
 	if len(ifaces) == 0 {
 		// Sin interfaces WireGuard en el router: no hay túneles que sondear.
@@ -285,6 +375,7 @@ func GetWireGuardStats(pool sshRunner, host, iface, subnet string, peerNames map
 	idx := 1
 	ok := 0
 	for _, ifc := range ifaces {
+		instance := WireGuardInstance{Interface: ifc, Status: "inactive", Role: "unknown", Peers: []WGPeer{}}
 		out, err := pool.Run(host, wgStatsCommand(ifc), 0)
 		if err != nil {
 			// La interfaz puede ser AmneziaWG (`wg` no la ve; #776): se
@@ -292,18 +383,31 @@ func GetWireGuardStats(pool sshRunner, host, iface, subnet string, peerNames map
 			out, err = pool.Run(host, awgStatsCommand(ifc), 0)
 			if err != nil {
 				// Una interfaz caída no tumba el resto: se salta (#714).
+				stats.Instances = append(stats.Instances, instance)
 				continue
 			}
 		}
 		ok++
+		instance.Status = "active"
 		dump, uci := splitWGUci(out)
+		roles := parseWGUciPeerRoles(uci, ifc)
 		for k, v := range parseWGUciDescs(uci) {
 			descs[k] = v
 		}
 		for _, p := range ParseWGDump(dump) {
-			stats.Peers = append(stats.Peers, buildWGPeer(p, peerNames, descs, nowSec, idx))
+			peer := buildWGPeer(p, peerNames, descs, nowSec, idx)
+			peer.PublicKey = p.Pubkey
+			peer.Interface = ifc
+			peer.LocalRole = roles[p.Pubkey]
+			if peer.LocalRole == "" {
+				peer.LocalRole = "unknown"
+			}
+			stats.Peers = append(stats.Peers, peer)
+			instance.Peers = append(instance.Peers, peer)
 			idx++
 		}
+		instance.Role = wgInstanceRole(instance.Peers)
+		stats.Instances = append(stats.Instances, instance)
 	}
 	if ok == 0 {
 		// Ninguna interfaz respondió: túnel inactivo, sin error (#714).

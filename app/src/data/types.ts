@@ -21,8 +21,8 @@ export interface Router {
   /** Modelo corto para captions: "GL.iNet Flint 2" */
   modelShort: string
   role: string
-  /** Pill de rol: "Principal" | "AP" | "SW" */
-  roleBadge: 'Principal' | 'AP' | 'SW'
+  /** Pill de rol devuelta por el servidor. */
+  roleBadge: 'Principal' | 'Secondary' | 'AP' | 'SW'
   ip: string
   /** MAC del bridge br-lan (live) */
   mac?: string
@@ -112,6 +112,18 @@ export interface WanInfo {
   speedtestServer?: string
 }
 
+/** WAN sondeada en un router concreto; no incluye tráfico global ni speedtest. */
+export interface RouterWanInfo {
+  proto?: string
+  publicIp?: string
+  gateway?: string
+  dns?: string[]
+  downMbps?: number
+  upMbps?: number
+  latencyMs?: number
+  lossPct?: number
+}
+
 export interface TrafficPoint {
   /** Etiqueta del eje X ("14:00", "Lun", "12 nov"…) */
   t: string
@@ -155,6 +167,11 @@ export type DeviceInfra = 'hypervisor' | 'ct' | 'managed-switch'
 
 export interface WGPeer {
   id: string
+  /** Stable opaque identity of the remote public key, shared across routers. */
+  keyFingerprint?: string
+  interface?: string
+  /** Role of this router relative to the remote peer, inferred from configuration. */
+  localRole?: 'client' | 'server' | 'unknown'
   name: string
   type: PeerType
   tunnelIp: string
@@ -169,6 +186,19 @@ export interface WireGuardStats {
   subnet: string
   status: 'active' | 'inactive'
   peers: WGPeer[]
+  instances?: WireGuardInstance[]
+}
+
+export interface WireGuardInstance {
+  interface: string
+  status: 'active' | 'inactive'
+  role: 'client' | 'server' | 'mixed' | 'unknown'
+  peers: WGPeer[]
+}
+
+export interface RouterWireGuard {
+  routerId: string
+  stats: WireGuardStats
 }
 
 export type DeviceType =
@@ -356,6 +386,8 @@ export interface TopoSemLink {
   kind: 'wan' | 'uplink' | 'wired' | 'dist' | 'wg'
   /** puerto físico si aplica */
   port?: string
+  /** WG interface on the source router. */
+  interface?: string
 }
 
 /**
@@ -389,6 +421,7 @@ export interface TopologyOverride {
  */
 export interface TopoSemantics {
   links: TopoSemLink[]
+  routerParents?: Record<string, string>
   /** routerId → ids de Device en su anillo (cableados primero, luego 5/2.4 GHz) */
   rings: Record<string, string[]>
   /** routerId → nº de clientes no pintados como chip (el "+N") */
@@ -399,9 +432,11 @@ export interface TopoSemantics {
 export interface OverviewBundle {
   health: HealthScore
   wan: WanInfo
+  routerWans?: Record<string, RouterWanInfo>
   traffic: Record<TimeRange, TrafficPoint[]>
   adguard: AdGuardStats
   wireguard: WireGuardStats
+  wireguards?: RouterWireGuard[]
   routers: Router[]
   deviceTotals: DeviceTotals
   topDevices: Device[]

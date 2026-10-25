@@ -8,15 +8,18 @@
 //   - El switch gestionado existe como Device Y como distnode managed: se
 //     excluye de chips/enlaces cualquier Device cuya MAC coincida con la
 //     chassis-MAC de un distnode managed (D1).
-//   - Anclaje al gateway: cableado SIN evidencia (ni attachTo ni puerto FDB)
-//     cuelga del gateway, no de su AP.
+//   - Anclaje al router que atribuye el cliente: sin puerto FDB no se inventa
+//     un uplink de AP ni se cambia el sitio del dispositivo.
 //   - Solo los distnodes inferred|managed son hubs de enlaces "dist"; el
 //     hipervisor enlaza vía su Device host (sus CTs/VMs cuelgan del host).
 //   - Peers WG: los activos que exceden las 4 coordenadas canónicas no
 //     generan enlace (la app los agrupa en su chip "+N" de peers).
 package adapters
 
-import "strings"
+import (
+	"net"
+	"strings"
+)
 
 // Capacidad de los anillos canónicos de model.ts (GATEWAY_RINGS 8+12+16+24,
 // AP_RINGS 8+14+18): el límite de chips visibles por anillo que aplica la app.
@@ -35,6 +38,15 @@ const maxTopoPeerChips = 4
 // BuildTopoSemantics deriva enlaces, anillos y peers ocultos del mismo bundle
 // que hoy consume la app (routers, devices, wireguard, distributionNodes).
 func BuildTopoSemantics(routers []Router, devices []Device, wg WireGuardStats, dists []DistributionNode) *TopoSemantics {
+	return buildTopoSemantics(routers, devices, wg, nil, dists)
+}
+
+// BuildTopoSemanticsWithWireguards keeps each router's tunnel independent.
+func BuildTopoSemanticsWithWireguards(routers []Router, devices []Device, wireguards []RouterWireGuard, dists []DistributionNode) *TopoSemantics {
+	return buildTopoSemantics(routers, devices, WireGuardStats{}, wireguards, dists)
+}
+
+func buildTopoSemantics(routers []Router, devices []Device, wg WireGuardStats, wireguards []RouterWireGuard, dists []DistributionNode) *TopoSemantics {
 	sem := &TopoSemantics{Links: []TopoLink{}, Rings: map[string][]string{}}
 	if len(routers) == 0 {
 		return sem
@@ -58,6 +70,7 @@ func BuildTopoSemantics(routers []Router, devices []Device, wg WireGuardStats, d
 		}
 	}
 	routerNodes := append([]Router{gateway}, nonGateway...)
+	sem.RouterParents = topologyRouterParents(routers, devices)
 	inRouter := map[string]bool{}
 	for _, r := range routerNodes {
 		inRouter[r.ID] = true
@@ -88,8 +101,7 @@ func BuildTopoSemantics(routers []Router, devices []Device, wg WireGuardStats, d
 	}
 
 	// hubOf: attachTo (si resuelve a router/distnode/device conocido) o su
-	// router; un cableado SIN evidencia (ni attachTo ni puerto FDB) se ancla
-	// al GATEWAY (regla 2-Ago-2026 de model.ts).
+	// router. A client attribution is stronger than an absent FDB port.
 	hubOf := func(d Device) string {
 		if d.AttachTo != "" {
 			if inRouter[d.AttachTo] {
@@ -101,9 +113,6 @@ func BuildTopoSemantics(routers []Router, devices []Device, wg WireGuardStats, d
 			if _, ok := deviceByID[d.AttachTo]; ok {
 				return d.AttachTo
 			}
-		}
-		if d.Band == "cable" && d.Port == "" {
-			return gateway.ID
 		}
 		return d.RouterID
 	}
@@ -134,9 +143,32 @@ func BuildTopoSemantics(routers []Router, devices []Device, wg WireGuardStats, d
 	}
 
 	// -- enlaces (mismo orden que model.ts) --------------------------------
-	sem.Links = append(sem.Links, TopoLink{From: "internet", To: gateway.ID, Kind: "wan"})
+	wanCount := 0
+	rootCount := 0
+	for _, rn := range routerNodes {
+		if rn.RoleBadge == "Principal" || rn.RoleBadge == "Secondary" {
+			rootCount++
+		}
+	}
+	for _, rn := range routerNodes {
+		if rn.RoleBadge == "Principal" || rn.RoleBadge == "Secondary" {
+			internetID := "internet"
+			if rootCount > 1 {
+				internetID = "internet-" + rn.ID
+			}
+			sem.Links = append(sem.Links, TopoLink{From: internetID, To: rn.ID, Kind: "wan"})
+			wanCount++
+		}
+	}
+	if wanCount == 0 {
+		sem.Links = append(sem.Links, TopoLink{From: "internet", To: gateway.ID, Kind: "wan"})
+	}
 	for _, ap := range nonGateway {
-		l := TopoLink{From: gateway.ID, To: ap.ID, Kind: "uplink"}
+		parent := sem.RouterParents[ap.ID]
+		if parent == "" {
+			continue
+		}
+		l := TopoLink{From: parent, To: ap.ID, Kind: "uplink"}
 		if ap.Lldp != nil {
 			l.Port = ap.Lldp.PortDesc // puerto del uplink en el gateway (C2)
 		}
@@ -220,17 +252,28 @@ func BuildTopoSemantics(routers []Router, devices []Device, wg WireGuardStats, d
 			wiredLink(dn.HostDeviceID, d)
 		}
 	}
-	// túneles WG: peers activos con coordenada canónica (máx 4)
-	n := 0
-	for _, p := range wg.Peers {
-		if !p.Active {
-			continue
+	// Legacy demo topology retains peer→Internet links. Live topology uses
+	// one peer node per public key and one router→peer edge per tunnel.
+	if wireguards == nil {
+		n := 0
+		for _, p := range wg.Peers {
+			if p.Active && n < maxTopoPeerChips {
+				sem.Links = append(sem.Links, TopoLink{From: "peer-" + p.ID, To: "internet", Kind: "wg"})
+				n++
+			}
 		}
-		if n >= maxTopoPeerChips {
-			break
+	} else {
+		visible := map[string]bool{}
+		for _, rw := range wireguards {
+			for _, p := range rw.Stats.Peers {
+				peerID := topologyPeerID(rw.RouterID, p)
+				if !visible[peerID] && len(visible) >= maxTopoPeerChips {
+					continue
+				}
+				visible[peerID] = true
+				sem.Links = append(sem.Links, TopoLink{From: rw.RouterID, To: peerID, Kind: "wg", Interface: p.Interface})
+			}
 		}
-		sem.Links = append(sem.Links, TopoLink{From: "peer-" + p.ID, To: "internet", Kind: "wg"})
-		n++
 	}
 
 	// -- anillos por router --------------------------------------------------
@@ -264,7 +307,7 @@ func BuildTopoSemantics(routers []Router, devices []Device, wg WireGuardStats, d
 		}
 		sem.Rings[rn.ID] = ring
 		cap := topoAPRingCap
-		if rn.ID == gateway.ID {
+		if rn.RoleBadge == "Principal" || rn.RoleBadge == "Secondary" {
 			cap = topoGatewayRingCap
 		}
 		if hidden := len(ring) - cap; hidden > 0 {
@@ -275,4 +318,132 @@ func BuildTopoSemantics(routers []Router, devices []Device, wg WireGuardStats, d
 		}
 	}
 	return sem
+}
+
+func topologyPeerID(routerID string, peer WGPeer) string {
+	if peer.KeyFingerprint != "" {
+		return "peer-key-" + peer.KeyFingerprint
+	}
+	// Local IDs can repeat on different routers; never merge by name or IP.
+	return "peer-" + routerID + "-" + peer.ID
+}
+
+// topologyRouterParents finds an AP/switch's upstream without assuming that
+// every non-primary router belongs to the primary's LAN. Exact client/LLDP
+// identity wins; a unique DNS site suffix is a fallback for routers whose
+// management host is a FQDN but whose observed client name is shortened.
+func topologyRouterParents(routers []Router, devices []Device) map[string]string {
+	parents := map[string]string{}
+	roots := make([]Router, 0, len(routers))
+	for _, r := range routers {
+		if r.RoleBadge == "Principal" || r.RoleBadge == "Secondary" {
+			roots = append(roots, r)
+		}
+	}
+	if len(roots) == 0 && len(routers) > 0 {
+		roots = append(roots, routers[0])
+	}
+	rootIDs := map[string]bool{}
+	for _, root := range roots {
+		rootIDs[root.ID] = true
+	}
+	identity := func(a, b string) bool {
+		return a != "" && b != "" && strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+	}
+	suffix := func(s string) string {
+		if net.ParseIP(strings.TrimSpace(s)) != nil {
+			return ""
+		}
+		parts := strings.Split(strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), ".")), ".")
+		if len(parts) < 3 {
+			return ""
+		}
+		return strings.Join(parts[1:], ".")
+	}
+	for _, r := range routers {
+		if rootIDs[r.ID] {
+			continue
+		}
+		if r.Lldp != nil {
+			for _, root := range roots {
+				if identity(r.Lldp.Chassis, root.MAC) || identity(r.Lldp.Mgmt, root.IP) || identity(r.Lldp.Chassis, root.Name) {
+					parents[r.ID] = root.ID
+					break
+				}
+			}
+		}
+		if parents[r.ID] != "" {
+			continue
+		}
+		matched := ""
+		ambiguous := false
+		for _, d := range devices {
+			if !rootIDs[d.RouterID] {
+				continue
+			}
+			if !(identity(r.MAC, d.MAC) || identity(r.IP, d.IP) || identity(r.IP, d.Name) || identity(r.Name, d.Name)) {
+				continue
+			}
+			if matched != "" && matched != d.RouterID {
+				ambiguous = true
+				break
+			}
+			matched = d.RouterID
+		}
+		if matched != "" && !ambiguous {
+			parents[r.ID] = matched
+			continue
+		}
+		// Site-qualified hostnames outrank short DHCP client names: an AP
+		// called ap-2 may be observed behind another site's router too.
+		nameSuffix := suffix(r.IP)
+		if nameSuffix == "" {
+			nameSuffix = suffix(r.Name)
+		}
+		if nameSuffix != "" {
+			candidate := ""
+			for _, root := range roots {
+				rootSuffix := suffix(root.IP)
+				if rootSuffix == "" {
+					rootSuffix = suffix(root.Name)
+				}
+				if rootSuffix != nameSuffix {
+					continue
+				}
+				if candidate != "" {
+					candidate = ""
+					break
+				}
+				candidate = root.ID
+			}
+			if candidate != "" {
+				parents[r.ID] = candidate
+				continue
+			}
+		}
+		// DHCP/device discovery often reports only the AP's short hostname.
+		// Use it only when it identifies one root and the site is unresolved.
+		shortName := strings.Split(strings.ToLower(r.IP), ".")[0]
+		if suffix(r.IP) != "" && shortName != "" {
+			matched, ambiguous = "", false
+			for _, d := range devices {
+				if !rootIDs[d.RouterID] || !strings.EqualFold(d.Name, shortName) {
+					continue
+				}
+				if matched != "" && matched != d.RouterID {
+					ambiguous = true
+					break
+				}
+				matched = d.RouterID
+			}
+			if matched != "" && !ambiguous {
+				parents[r.ID] = matched
+				continue
+			}
+		}
+		if len(roots) == 1 {
+			parents[r.ID] = roots[0].ID
+		}
+	}
+	return parents
 }

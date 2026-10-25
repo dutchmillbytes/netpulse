@@ -350,6 +350,7 @@ interface ConfigRouter {
   host: string
   type: RouterType
   is_gateway: boolean
+  is_router: boolean
   agent_only: boolean
   firmware_target: string
   snmp_enabled: boolean
@@ -380,6 +381,7 @@ function RoutersManager({ reduce, onSaved }: { reduce: boolean; onSaved: () => v
   const [name, setName] = useState('')
   const [type, setType] = useState<RouterType>('openwrt')
   const [gateway, setGateway] = useState(false)
+  const [routerRole, setRouterRole] = useState(false)
   const [agentOnly, setAgentOnly] = useState(false)
   const [addSshPort, setAddSshPort] = useState(22)
   const [submitting, setSubmitting] = useState(false)
@@ -396,6 +398,7 @@ function RoutersManager({ reduce, onSaved }: { reduce: boolean; onSaved: () => v
   const [editName, setEditName] = useState('')
   const [editType, setEditType] = useState<RouterType>('openwrt')
   const [editGateway, setEditGateway] = useState(false)
+  const [editRouterRole, setEditRouterRole] = useState(false)
   const [editAgentOnly, setEditAgentOnly] = useState(false)
   const [editFirmwareTarget, setEditFirmwareTarget] = useState('')
   const [editSnmpEnabled, setEditSnmpEnabled] = useState(false)
@@ -549,6 +552,7 @@ function RoutersManager({ reduce, onSaved }: { reduce: boolean; onSaved: () => v
           name: name.trim() || undefined,
           type,
           gateway,
+          router: routerRole,
           agent_only: agentOnly,
           ssh_port: addSshPort,
         }),
@@ -562,6 +566,7 @@ function RoutersManager({ reduce, onSaved }: { reduce: boolean; onSaved: () => v
       setName('')
       setType('openwrt')
       setGateway(false)
+      setRouterRole(false)
       setAgentOnly(false)
       setAddSshPort(22)
       setShowAddForm(false)
@@ -581,6 +586,7 @@ function RoutersManager({ reduce, onSaved }: { reduce: boolean; onSaved: () => v
     setEditName(r.name ?? '')
     setEditType(r.type)
     setEditGateway(r.is_gateway)
+    setEditRouterRole(r.is_router ?? false)
     setEditAgentOnly(r.agent_only)
     setEditFirmwareTarget(r.firmware_target ?? '')
     setEditSnmpEnabled(r.snmp_enabled ?? false)
@@ -607,6 +613,7 @@ function RoutersManager({ reduce, onSaved }: { reduce: boolean; onSaved: () => v
           name: editName.trim() || undefined,
           type: editType,
           gateway: editGateway,
+          router: editRouterRole,
           agent_only: editAgentOnly,
           firmware_target: editFirmwareTarget.trim(),
           snmp_enabled: editSnmpEnabled,
@@ -736,7 +743,11 @@ function RoutersManager({ reduce, onSaved }: { reduce: boolean; onSaved: () => v
                   <td className="px-3.5 py-2.5">
                     {r.is_gateway ? (
                       <span className="rounded bg-accent-soft px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-accent">
-                        {t('settings.routers.gatewayBadge')}
+                        {t('common.rolePrimary')}
+                      </span>
+                    ) : r.is_router ? (
+                      <span className="rounded bg-accent-soft px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-accent">
+                        {t('common.roleSecondary')}
                       </span>
                     ) : r.agent_only ? (
                       <span className="rounded bg-elevated px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-text-muted ring-1 ring-inset ring-border">
@@ -752,7 +763,7 @@ function RoutersManager({ reduce, onSaved }: { reduce: boolean; onSaved: () => v
                       </span>
                     ) : (
                       <span className="rounded bg-elevated px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-text-primary ring-1 ring-inset ring-border">
-                        {t('settings.routers.openWrtBadge')}
+                        {t('common.roleAP')}
                       </span>
                     )}
                   </td>
@@ -950,8 +961,12 @@ function RoutersManager({ reduce, onSaved }: { reduce: boolean; onSaved: () => v
             ariaLabel={t('settings.routers.type')}
           />
           <label className="flex cursor-pointer items-center gap-2 text-sm text-text-secondary">
-            <Switch checked={gateway} onCheckedChange={setGateway} />
+            <Switch checked={gateway} onCheckedChange={(checked) => { setGateway(checked); if (checked) setRouterRole(true) }} />
             {t('settings.routers.gateway')}
+          </label>
+          <label className="flex cursor-pointer items-center gap-2 text-sm text-text-secondary">
+            <Switch checked={routerRole} onCheckedChange={(checked) => { setRouterRole(checked); if (!checked) setGateway(false) }} />
+            {t('settings.routers.routerRole')}
           </label>
           <label className="flex cursor-pointer items-center gap-2 text-sm text-text-secondary">
             <Switch checked={agentOnly} onCheckedChange={setAgentOnly} />
@@ -1050,8 +1065,12 @@ function RoutersManager({ reduce, onSaved }: { reduce: boolean; onSaved: () => v
                   ariaLabel={t('settings.routers.type')}
                 />
                 <label className="flex cursor-pointer items-center gap-2 text-sm text-text-secondary">
-                  <Switch checked={editGateway} onCheckedChange={setEditGateway} />
+                  <Switch checked={editGateway} onCheckedChange={(checked) => { setEditGateway(checked); if (checked) setEditRouterRole(true) }} />
                   {t('settings.routers.gateway')}
+                </label>
+                <label className="flex cursor-pointer items-center gap-2 text-sm text-text-secondary">
+                  <Switch checked={editRouterRole} onCheckedChange={(checked) => { setEditRouterRole(checked); if (!checked) setEditGateway(false) }} />
+                  {t('settings.routers.routerRole')}
                 </label>
                 <label className="flex cursor-pointer items-center gap-2 text-sm text-text-secondary">
                   <Switch checked={editAgentOnly} onCheckedChange={setEditAgentOnly} />

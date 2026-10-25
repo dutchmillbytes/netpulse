@@ -128,6 +128,7 @@ CREATE TABLE IF NOT EXISTS routers (
   host TEXT NOT NULL,
   type TEXT NOT NULL DEFAULT 'openwrt',
   is_gateway INTEGER NOT NULL DEFAULT 0,
+  is_secondary_router INTEGER NOT NULL DEFAULT 0 CHECK (is_secondary_router IN (0, 1) AND (is_secondary_router = 0 OR is_gateway = 0)),
   created_at INTEGER NOT NULL
 );
 -- Allowlist de dispositivos confiables (issue #196): una MAC conocida no
@@ -489,6 +490,7 @@ func Open(dataDir string, opts ...OpenOption) (*DB, error) {
 	// SPEC-65 D65-5: nombre visible por usuario ("" = usar el username).
 	migrate(sqldb, "users", "display_name", "ALTER TABLE users ADD COLUMN display_name TEXT DEFAULT ''")
 	migrate(sqldb, "routers", "agent_only", "ALTER TABLE routers ADD COLUMN agent_only INTEGER NOT NULL DEFAULT 0")
+	migrate(sqldb, "routers", "is_secondary_router", "ALTER TABLE routers ADD COLUMN is_secondary_router INTEGER NOT NULL DEFAULT 0 CHECK (is_secondary_router IN (0, 1) AND (is_secondary_router = 0 OR is_gateway = 0))")
 	// issue #196: bridgeMAC persistido del router (exclusión de "desconocido").
 	migrate(sqldb, "routers", "mac", "ALTER TABLE routers ADD COLUMN mac TEXT")
 	// issue #241: target de firmware por router (string libre; NULL/"" = sin comprobar).

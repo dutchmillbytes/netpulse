@@ -432,7 +432,8 @@ func NetDevBps(prevRx, prevTx, rx, tx, dt float64) (rxBps, txBps *float64) {
 }
 
 var pingLossRe = regexp.MustCompile(`(\d+(?:\.\d+)?)% packet loss`)
-var pingRTTRe = regexp.MustCompile(`= [\d.]+/([\d.]+)/[\d.]+/[\d.]+ ms`)
+// OpenWrt BusyBox reports min/avg/max; iputils adds a fourth mdev value.
+var pingRTTRe = regexp.MustCompile(`= [\d.]+/([\d.]+)/[\d.]+(?:/[\d.]+)? ms`)
 
 // ParsePingSummary extrae (latencia avg redondeada, pérdida %) del resumen de
 // ping; cada una es nil si su línea no está.

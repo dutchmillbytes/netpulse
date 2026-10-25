@@ -44,6 +44,43 @@ network.peer3.allowed_ips='10.0.0.4/32'`
 	}
 }
 
+func TestWireGuardRolesUseConfiguredEndpoint(t *testing.T) {
+	uci := `network.wg0=interface
+network.wg0.proto='wireguard'
+network.server=wireguard_wg0
+network.server.public_key='SERVER='
+network.server.endpoint_host='vps.example.org'
+network.server.endpoint_port='51820'
+network.client=wireguard_wg1
+network.client.public_key='CLIENT='
+network.other=wireguard_wg1
+network.other.public_key='OTHER='
+network.other.endpoint_host='other.example.org'`
+	if got := parseWGUciPeerRoles(uci, "wg0")["SERVER="]; got != "client" {
+		t.Fatalf("wg0 remote server role = %q, want client", got)
+	}
+	roles := parseWGUciPeerRoles(uci, "wg1")
+	if roles["CLIENT="] != "server" || roles["OTHER="] != "client" {
+		t.Fatalf("wg1 peer roles = %+v", roles)
+	}
+	if got := wgInstanceRole([]WGPeer{{LocalRole: "server"}, {LocalRole: "client"}}); got != "mixed" {
+		t.Fatalf("mixed role = %q", got)
+	}
+	if got := wgInstanceRole([]WGPeer{{LocalRole: "unknown"}}); got != "unknown" {
+		t.Fatalf("unknown role = %q", got)
+	}
+}
+
+func TestPeerKeyFingerprint(t *testing.T) {
+	a := peerKeyFingerprint("same-public-key")
+	if a == "" || a != peerKeyFingerprint("same-public-key") || a == peerKeyFingerprint("other-public-key") {
+		t.Fatalf("fingerprint must be stable and key-specific: %q", a)
+	}
+	if a == "same-public-key" || peerKeyFingerprint("") != "" {
+		t.Fatal("fingerprint must not expose the public key or identify an absent key")
+	}
+}
+
 func TestSplitWGUci(t *testing.T) {
 	out := "peer-a\tAAA=\t10.0.0.2/32\n===NETPULSE_UCI===\nnetwork.wg0=interface\n"
 	dump, uci := splitWGUci(out)
@@ -278,6 +315,30 @@ func TestGetWireGuardStatsSingleInterface(t *testing.T) {
 	}
 	if !p.Active {
 		t.Errorf("Active = false, want true (handshake reciente)")
+	}
+	if len(stats.Instances) != 1 || stats.Instances[0].Role != "server" || p.LocalRole != "server" {
+		t.Errorf("server instance/peer roles = %+v / %q", stats.Instances, p.LocalRole)
+	}
+}
+
+func TestGetWireGuardStatsClientInstance(t *testing.T) {
+	dump := wgPeerDump("wg0", wgPeerLine("REMOTE=", "10.200.0.0/24", fmt.Sprintf("%d", time.Now().Unix()-10)))
+	uci := "network.remote=wireguard_wg0\nnetwork.remote.public_key='REMOTE='\nnetwork.remote.endpoint_host='vps.example.org'\nnetwork.remote.endpoint_port='51820'\n"
+	f := &fakeWGRunner{run: func(cmd string) (string, error) {
+		if strings.Contains(cmd, "wg show wg0 dump") {
+			return wgStatsOutput(dump, uci), nil
+		}
+		return "", fmt.Errorf("unexpected command: %s", cmd)
+	}}
+	stats, err := GetWireGuardStats(f, "host", "wg0", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.Instances) != 1 || stats.Instances[0].Role != "client" || stats.Peers[0].LocalRole != "client" {
+		t.Fatalf("client role missing: %+v", stats)
+	}
+	if stats.Peers[0].KeyFingerprint == "" || stats.Peers[0].PublicKey != "REMOTE=" {
+		t.Fatal("remote public key should retain an opaque grouping identity")
 	}
 }
 

@@ -48,10 +48,15 @@ func mbps(bps *float64) float64 {
 	return math.Round(*bps/1e6*10) / 10
 }
 
-// pickGateway: is_gateway → glinet → primero.
+// pickGateway: explicit primary → router-role device → legacy fallback.
 func pickGateway(routers []RouterConfig) *RouterConfig {
 	for i := range routers {
 		if routers[i].IsGateway {
+			return &routers[i]
+		}
+	}
+	for i := range routers {
+		if routers[i].IsRouter {
 			return &routers[i]
 		}
 	}
@@ -75,6 +80,11 @@ func pickGatewayCfg(polled map[string]*routerPolled) *RouterConfig {
 	sort.Strings(ids)
 	for _, id := range ids {
 		if polled[id].cfg.IsGateway {
+			return &polled[id].cfg
+		}
+	}
+	for _, id := range ids {
+		if polled[id].cfg.IsRouter {
 			return &polled[id].cfg
 		}
 	}
@@ -129,8 +139,7 @@ type routerPolled struct {
 	// luci: etiquetas de puertos/VLANs de LuCI (issue #258), si el router las
 	// define en /etc/config/luci. Fuente de nombres para la topología.
 	luci *probe.LuCILabels
-	// wanInfo: estado de la conexión WAN (solo gateway, issue #276). Los APs
-	// dejan el struct vacío (sin datos WAN).
+	// wanInfo: estado de la conexión WAN de routers primarios y secundarios.
 	wanInfo probe.WanInfo
 	// vlans: VLANs del bridge (issue #315, bridge vlan show). nil = sin
 	// datos (router sin bridge vlan filtering o sonda fallida).
@@ -255,10 +264,12 @@ type Live struct {
 	// flap breve no cierre el incidente.
 	offlineOpen   map[string]bool
 	recoverStreak map[string]int
-	engine              *alerts.Engine
-	wgActive            map[string]bool
-	weakAlerted         map[string]int64
-	onlineMacs          map[string]bool
+	engine        *alerts.Engine
+	wgActive      map[string]map[string]bool
+	wgByRouter    map[string]WireGuardStats
+	wgRunner      sshRunner
+	weakAlerted   map[string]int64
+	onlineMacs    map[string]bool
 	// unknownGrace: ticks consecutivos online+sin nombre (Name == MAC) por
 	// MAC. unknownAlerted: MACs que ya dispararon la alerta de desconocido
 	// (issue #248, persistido en kv: cada MAC alerta UNA sola vez).
@@ -381,7 +392,9 @@ func NewLive(cfg *config.Config, d *db.DB, initial []RouterConfig, pool *SSHPool
 		offlineOpen:          map[string]bool{},
 		recoverStreak:        map[string]int{},
 		engine:               alerts.New(d, nil),
-		wgActive:             map[string]bool{},
+		wgActive:             map[string]map[string]bool{},
+		wgByRouter:           map[string]WireGuardStats{},
+		wgRunner:             pool,
 		weakAlerted:          map[string]int64{},
 		onlineMacs:           map[string]bool{},
 		unknownGrace:         map[string]int{},
@@ -470,6 +483,13 @@ func (l *Live) SetRouters(list []RouterConfig) {
 	defer l.mu.Unlock()
 	l.routers = append([]RouterConfig(nil), list...)
 	l.gatewayCfg = pickGateway(l.routers)
+	l.usteerCheckedAt = time.Time{}
+	if l.wgByRouter == nil {
+		l.wgByRouter = map[string]WireGuardStats{}
+	}
+	if l.wgActive == nil {
+		l.wgActive = map[string]map[string]bool{}
+	}
 	l.clients = map[string]*OpenWrtClient{}
 	for _, c := range l.routers {
 		if !c.AgentOnly {
@@ -543,6 +563,22 @@ func (l *Live) SetRouters(list []RouterConfig) {
 	for id := range l.lastErr {
 		if !ids[id] {
 			delete(l.lastErr, id)
+		}
+	}
+	primaryID := ""
+	if l.gatewayCfg != nil {
+		primaryID = l.gatewayCfg.ID
+	}
+	for _, r := range l.routers {
+		if !r.ReceivesRouterChecks(primaryID) {
+			delete(l.wgByRouter, r.ID)
+			delete(l.wgActive, r.ID)
+		}
+	}
+	for id := range l.wgByRouter {
+		if !ids[id] {
+			delete(l.wgByRouter, id)
+			delete(l.wgActive, id)
 		}
 	}
 	// unknownGrace es per-MAC (no por router): se poda por ausencia en
@@ -889,8 +925,16 @@ func (l *Live) pollRouter(ctx context.Context, cfg RouterConfig) (*routerPolled,
 		gw := l.gatewayCfg
 		client := l.clients[cfg.ID]
 		l.mu.Unlock()
-		if gw != nil && cfg.ID == gw.ID && client != nil {
+		primaryID := ""
+		if gw != nil {
+			primaryID = gw.ID
+		}
+		if cfg.ReceivesRouterChecks(primaryID) && client != nil {
 			p.wanInfo = l.probeWanInfo(cfg.ID, client)
+			// Probe each routing device directly; agent latency may target a gateway.
+			if latency, loss, err := client.GetWanLatency(""); err == nil && latency != nil {
+				p.latencyMs, p.lossPct = latency, loss
+			}
 		}
 		return p, nil
 	}
@@ -1001,16 +1045,20 @@ func (l *Live) pollRouter(ctx context.Context, cfg RouterConfig) (*routerPolled,
 		ramPct = memUsagePct(mem.Total, mem.Free, mem.Buffered, mem.Cached, mem.Available, mem.Used)
 	}
 
-	isGw := gw != nil && cfg.ID == gw.ID
+	primaryID := ""
+	if gw != nil {
+		primaryID = gw.ID
+	}
+	isRoutingRouter := cfg.ReceivesRouterChecks(primaryID)
 	var latencyMs, lossPct *float64
-	if isGw {
+	if isRoutingRouter {
 		latencyMs, lossPct, _ = client.GetWanLatency("")
 	} else if gw != nil {
 		latencyMs, _ = client.GetGatewayLatency(gw.Host)
 	}
-	// Estado WAN solo en el gateway (issue #276), tier lento cacheado.
+	// WAN status is cached separately for each routing device.
 	var wanInfo probe.WanInfo
-	if isGw {
+	if isRoutingRouter {
 		wanInfo = l.probeWanInfo(cfg.ID, client)
 	}
 
@@ -1157,6 +1205,8 @@ func (l *Live) buildRouter(p *routerPolled, history []histPoint) Router {
 	}
 	if isGw {
 		r.Role, r.RoleBadge = "Gateway principal", "Principal"
+	} else if p.cfg.IsRouter {
+		r.Role, r.RoleBadge = "Router secundario", "Secondary"
 	} else if p.cfg.AgentOnly {
 		r.Role, r.RoleBadge = "Switch", "SW"
 	} else {
@@ -1262,11 +1312,17 @@ func (l *Live) offlineRouter(cfg RouterConfig) Router {
 			CPU: iptr(0), RAM: iptr(0), Temp: iptr(0),
 			Uptime: "—", Clients: 0, Sparkline: []float64{},
 		}
-		if gw != nil && cfg.ID == gw.ID {
-			r.Role, r.RoleBadge = "Gateway principal", "Principal"
-		} else {
-			r.Role, r.RoleBadge = "Punto de acceso", "AP"
-		}
+	}
+	// Re-evaluate the role from current configuration even if the last good
+	// snapshot predates a settings change.
+	if gw != nil && cfg.ID == gw.ID {
+		r.Role, r.RoleBadge = "Gateway principal", "Principal"
+	} else if cfg.IsRouter {
+		r.Role, r.RoleBadge = "Router secundario", "Secondary"
+	} else if cfg.AgentOnly {
+		r.Role, r.RoleBadge = "Switch", "SW"
+	} else {
+		r.Role, r.RoleBadge = "Punto de acceso", "AP"
 	}
 	r.Status = "offline"
 	if l.accessMissing(cfg.ID) {
@@ -1407,7 +1463,11 @@ func (l *Live) pollAll(ctx context.Context) map[string]*routerPolled {
 			l.lastStatus[res.cfg.ID] = "online"
 			// WAN/Internet caído: gateway OK pero ping a internet con 100 %
 			// de pérdida en 2 sondeos seguidos (mismo debounce que offline).
-			if l.gatewayCfg != nil && res.cfg.ID == l.gatewayCfg.ID {
+			primaryID := ""
+			if l.gatewayCfg != nil {
+				primaryID = l.gatewayCfg.ID
+			}
+			if res.cfg.ReceivesRouterChecks(primaryID) {
 				l.trackWanDown(&res.cfg, res.p)
 			}
 			continue
@@ -1923,55 +1983,112 @@ func (l *Live) pollAdGuard(ctx context.Context) *AdGuardStats {
 	return stats
 }
 
-// pollWireGuard: stats WG del gateway + alerta de handshake nuevo.
-func (l *Live) pollWireGuard(devices []Device) *WireGuardStats {
-	l.mu.Lock()
-	gw := l.gatewayCfg
-	l.mu.Unlock()
-	if gw == nil {
-		return nil
-	}
+// pollWireGuard probes one router and keeps handshake transitions independent
+// from every other router. Only background collection calls this method.
+func (l *Live) pollWireGuard(router RouterConfig, devices []Device) *WireGuardStats {
 	peerNames := map[string]WGPeerName{}
 	for _, d := range devices {
-		if d.IP != "" {
+		if d.RouterID == router.ID && d.IP != "" {
 			peerNames[d.IP] = WGPeerName{ID: d.ID, Name: d.Name, Type: d.Type}
 		}
 	}
-	stats, err := GetWireGuardStats(l.pool, gw.SSHAddr(), l.cfg.WGInterface, "", peerNames)
-	if err != nil {
-		log.Printf("[netpulse] WireGuard no disponible: %v", err)
-		return &WireGuardStats{Interface: l.cfg.WGInterface, Subnet: "", Status: "inactive", Peers: []WGPeer{}}
+	iface := "auto"
+	if l.cfg != nil && l.cfg.WGInterface != "" {
+		iface = l.cfg.WGInterface
 	}
-	// Alerta en handshake nuevo (peer pasa a activo)
+	runner := l.wgRunner
+	if runner == nil {
+		runner = l.pool
+	}
+	if runner == nil {
+		return nil
+	}
+	stats, err := GetWireGuardStats(runner, router.SSHAddr(), iface, "", peerNames)
+	if err != nil {
+		log.Printf("[netpulse] WireGuard no disponible en %s: %v", router.ID, err)
+		inactive := &WireGuardStats{Interface: iface, Subnet: "", Status: "inactive", Peers: []WGPeer{}, Instances: []WireGuardInstance{}}
+		l.mu.Lock()
+		if l.wgByRouter == nil {
+			l.wgByRouter = map[string]WireGuardStats{}
+		}
+		l.wgByRouter[router.ID] = *inactive
+		l.mu.Unlock()
+		return inactive
+	}
+	// The public key and interface remain stable if peers are reordered. A
+	// router ID scopes the state and alert ID across independent sites.
 	activeNow := map[string]bool{}
+	activeNames := map[string]string{}
 	for _, p := range stats.Peers {
 		if p.Active {
-			activeNow[p.ID] = true
+			key := p.Interface + ":" + p.PublicKey
+			if p.PublicKey == "" {
+				key = p.Interface + ":" + p.ID
+			}
+			activeNow[key] = true
+			activeNames[key] = p.Name
 		}
 	}
 	l.mu.Lock()
-	for id := range activeNow {
-		if !l.wgActive[id] && len(l.wgActive) > 0 {
-			name := id
-			for _, p := range stats.Peers {
-				if p.ID == id {
-					name = p.Name
-				}
-			}
+	if l.wgActive == nil {
+		l.wgActive = map[string]map[string]bool{}
+	}
+	if l.wgByRouter == nil {
+		l.wgByRouter = map[string]WireGuardStats{}
+	}
+	previous, hadPrevious := l.wgActive[router.ID]
+	for key := range activeNow {
+		if hadPrevious && !previous[key] {
+			name := activeNames[key]
 			l.engine.Emit(AlertEvent{
-				ID:       fmt.Sprintf("alert-wg-%s-%d", id, time.Now().UnixMilli()),
+				ID:       fmt.Sprintf("alert-wg-%s-%s-%d", router.ID, key, time.Now().UnixMilli()),
 				Category: alerts.CatVPN, Urgent: false,
 				Severity: "info", Title: "Handshake WireGuard",
 				Description: name + " conectado",
 				Type:        alerts.TypeWireguardHandshake,
 				Vars:        map[string]string{"peer": name},
-				Time:        "ahora mismo", RouterID: gw.ID,
+				Time:        "ahora mismo", RouterID: router.ID,
 			})
 		}
 	}
-	l.wgActive = activeNow
+	l.wgActive[router.ID] = activeNow
+	l.wgByRouter[router.ID] = *stats
 	l.mu.Unlock()
 	return stats
+}
+
+// pollRouterWireGuard collects every routing device with a bounded number of
+// probes. One failure only affects that router's snapshot.
+func (l *Live) pollRouterWireGuard(ctx context.Context, routers []RouterConfig, primaryID string, devices []Device) map[string]WireGuardStats {
+	results := make(map[string]WireGuardStats)
+	var resultsMu sync.Mutex
+	var wg sync.WaitGroup
+	limit := make(chan struct{}, 3)
+	for _, router := range routers {
+		if !router.ReceivesRouterChecks(primaryID) || router.AgentOnly || router.SnmpEnabled {
+			continue
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		go func(router RouterConfig) {
+			defer wg.Done()
+			select {
+			case limit <- struct{}{}:
+				defer func() { <-limit }()
+			case <-ctx.Done():
+				return
+			}
+			if stats := l.pollWireGuard(router, devices); stats != nil {
+				resultsMu.Lock()
+				results[router.ID] = *stats
+				resultsMu.Unlock()
+			}
+		}(router)
+	}
+	wg.Wait()
+	return results
 }
 
 // buildDevices: unión de leases + MACs vistas (wireless > FDB satélites >
@@ -2606,17 +2723,11 @@ func (l *Live) buildOverview(ctx context.Context) (*Overview, error) {
 	// overrides manuales: un override explícito del usuario tiene prioridad
 	// sobre el sello.
 	distNodes = l.sealProxmoxInfra(devices, distNodes)
-	// Supresión topológica (#332): actualizar grafo parent→child.
-	// Todos los no-gateway cuelgan del gateway.
+	// Supresión topológica (#332): only observed AP/switch uplinks are
+	// parent→child. A secondary router has its own routing root.
 	l.mu.Lock()
 	if gw != nil && l.suppression != nil {
-		parents := map[string]string{}
-		for _, r := range routers {
-			if r.ID != gw.ID {
-				parents[r.ID] = gw.ID
-			}
-		}
-		l.suppression.SetTopology(parents)
+		l.suppression.SetTopology(topologyRouterParents(routerList, devices))
 	}
 	l.mu.Unlock()
 	// Aviso de señal débil (< -70 dBm): una alerta por dispositivo y día
@@ -2666,12 +2777,12 @@ func (l *Live) buildOverview(ctx context.Context) (*Overview, error) {
 			}
 		}
 	}
-	adguard := l.pollAdGuard(ctx)
-	wireguard := l.pollWireGuard(devices)
 	gwID := ""
 	if gw != nil {
 		gwID = gw.ID
 	}
+	adguard := l.pollAdGuard(ctx)
+	wgByRouter := l.pollRouterWireGuard(ctx, routers, gwID, devices)
 	wan := l.defaultWan(gw)
 	for _, r := range routerList {
 		if r.ID == gwID && r.Status == "offline" {
@@ -2690,9 +2801,27 @@ func (l *Live) buildOverview(ctx context.Context) (*Overview, error) {
 	if adguard != nil {
 		ag = *adguard
 	}
-	wgStats := WireGuardStats{Interface: l.cfg.WGInterface, Subnet: "", Status: "inactive", Peers: []WGPeer{}}
-	if wireguard != nil {
-		wgStats = *wireguard
+	wgIface := "auto"
+	if l.cfg != nil && l.cfg.WGInterface != "" {
+		wgIface = l.cfg.WGInterface
+	}
+	wgStats := WireGuardStats{Interface: wgIface, Subnet: "", Status: "inactive", Peers: []WGPeer{}, Instances: []WireGuardInstance{}}
+	if stats, ok := wgByRouter[gwID]; ok {
+		wgStats = stats
+	}
+	wireguards := routerWireGuardOverview(routers, gwID, wgByRouter, wgIface)
+	routerWANs := map[string]RouterWAN{}
+	for _, cfg := range routers {
+		p := polled[cfg.ID]
+		if p == nil || !cfg.ReceivesRouterChecks(gwID) {
+			continue
+		}
+		info := RouterWAN{Proto: p.wanInfo.Proto, PublicIP: p.wanInfo.IP, Gateway: p.wanInfo.Gateway, DNS: p.wanInfo.DNS, LatencyMs: p.latencyMs, LossPct: p.lossPct}
+		if p.net != nil {
+			down, up := mbps(p.net.RxBps), mbps(p.net.TxBps)
+			info.DownMbps, info.UpMbps = &down, &up
+		}
+		routerWANs[cfg.ID] = info
 	}
 	online := 0
 	for _, d := range devices {
@@ -2712,16 +2841,17 @@ func (l *Live) buildOverview(ctx context.Context) (*Overview, error) {
 	usteerAvailable := l.usteerAvailableCached()
 	dawnDetected := dawnDeprecatedFromPolled(polled)
 	return &Overview{
-		Health:  computeHealth(routerList, adguard),
-		WAN:     wan,
-		Traffic: TrafficByRange{H1: trafficOf("1h"), H24: trafficOf("24h"), D7: trafficOf("7d"), D30: trafficOf("30d")},
-		Adguard: ag, Wireguard: wgStats, Routers: routerList,
+		Health:     computeHealth(routerList, adguard),
+		WAN:        wan,
+		RouterWANs: routerWANs,
+		Traffic:    TrafficByRange{H1: trafficOf("1h"), H24: trafficOf("24h"), D7: trafficOf("7d"), D30: trafficOf("30d")},
+		Adguard:    ag, Wireguard: wgStats, Wireguards: wireguards, Routers: routerList,
 		DeviceTotals: DeviceTotals{
 			Total: len(devices), Online: online, KnownOffline: len(devices) - online, NewToday: 0,
 		},
 		TopDevices: top, Alerts: alertsCopy, UnreadAlerts: unread,
 		DistributionNodes: distNodes,
-		Topology:          BuildTopoSemantics(routerList, devices, wgStats, distNodes), // SPEC-65 D65-3
+		Topology:          BuildTopoSemanticsWithWireguards(routerList, devices, wireguards, distNodes),
 		Devices:           devices,
 		Usteer:            &UsteerOverview{Available: usteerAvailable},
 		DawnDeprecated:    dawnDetected,
@@ -2729,6 +2859,21 @@ func (l *Live) buildOverview(ctx context.Context) (*Overview, error) {
 		VM:                ViewModelVersion, // SPEC-65 D65-4
 		Ts:                time.Now().Unix(),
 	}, nil
+}
+
+func routerWireGuardOverview(routers []RouterConfig, primaryID string, byRouter map[string]WireGuardStats, iface string) []RouterWireGuard {
+	wireguards := make([]RouterWireGuard, 0, len(routers))
+	for _, router := range routers {
+		if !router.ReceivesRouterChecks(primaryID) {
+			continue
+		}
+		stats, ok := byRouter[router.ID]
+		if !ok {
+			stats = WireGuardStats{Interface: iface, Status: "inactive", Peers: []WGPeer{}, Instances: []WireGuardInstance{}}
+		}
+		wireguards = append(wireguards, RouterWireGuard{RouterID: router.ID, Stats: stats})
+	}
+	return wireguards
 }
 
 // classifyRoamingDaemon decide que daemon de roaming esta activo en la red a
@@ -2757,16 +2902,15 @@ func dawnDeprecatedFromPolled(polled map[string]*routerPolled) bool {
 	return false
 }
 
-// usteerAvailableCached devuelve si hay usteer en la red (cacheado). Lanza un
-// refresco asíncrono (1 SSH al gateway, TTL 30s) cuando el cache está stale,
-// sin bloquear el overview: la primera llamada devuelve false y el flag llega
-// en el overview siguiente una vez refrescado.
+// usteerAvailableCached checks all configured routing devices asynchronously.
+// The result is network-wide, while the primary remains the topology root.
 func (l *Live) usteerAvailableCached() bool {
 	l.mu.Lock()
 	avail := l.usteerAvailable
 	checked := l.usteerCheckedAt
 	checking := l.usteerChecking
 	gw := l.gatewayCfg
+	routers := append([]RouterConfig(nil), l.routers...)
 	l.mu.Unlock()
 	if gw == nil {
 		return false
@@ -2776,14 +2920,23 @@ func (l *Live) usteerAvailableCached() bool {
 	}
 	l.mu.Lock()
 	l.usteerChecking = true
-	host := gw.SSHAddr()
 	l.mu.Unlock()
 	go func() {
-		out, err := l.pool.Run(host, "ubus call usteer local_info", 4*time.Second)
+		found := false
+		for _, router := range routers {
+			if !router.ReceivesRouterChecks(gw.ID) || router.AgentOnly || router.SnmpEnabled {
+				continue
+			}
+			out, err := l.pool.Run(router.SSHAddr(), "ubus call usteer local_info", 4*time.Second)
+			if err == nil && strings.TrimSpace(out) != "" {
+				found = true
+				break
+			}
+		}
 		l.mu.Lock()
 		l.usteerChecking = false
 		l.usteerCheckedAt = time.Now()
-		l.usteerAvailable = err == nil && strings.TrimSpace(out) != ""
+		l.usteerAvailable = found
 		l.mu.Unlock()
 	}()
 	return avail
@@ -2854,6 +3007,7 @@ func (l *Live) GetRouterDetail(ctx context.Context, id string) (*RouterDetail, e
 	p := l.lastPolled[id]
 	gw := l.gatewayCfg
 	polledAll := l.lastPolled
+	wgStats, hasWGStats := l.wgByRouter[id]
 	l.mu.Unlock()
 	if cfg == nil {
 		return nil, nil
@@ -3145,9 +3299,33 @@ func (l *Live) GetRouterDetail(ctx context.Context, id string) (*RouterDetail, e
 		Series:  PerfSeries{H1: seriesOf("1h"), H24: seriesOf("24h"), D7: seriesOf("7d")},
 		Clients: clients, Extras: extras, Vlans: vlans,
 	}
+	primaryID := ""
+	if gw != nil {
+		primaryID = gw.ID
+	}
+	if p != nil && cfg.ReceivesRouterChecks(primaryID) {
+		wan := &RouterWAN{
+			Proto: p.wanInfo.Proto, PublicIP: p.wanInfo.IP,
+			Gateway: p.wanInfo.Gateway, DNS: p.wanInfo.DNS,
+			LatencyMs: p.latencyMs, LossPct: p.lossPct,
+		}
+		if p.net != nil {
+			down, up := mbps(p.net.RxBps), mbps(p.net.TxBps)
+			wan.DownMbps, wan.UpMbps = &down, &up
+		}
+		detail.WAN = wan
+		detail.WANTraffic24h = make([]TrafficPoint, 0)
+		for _, point := range l.metricsHistory(id, "24h") {
+			detail.WANTraffic24h = append(detail.WANTraffic24h, TrafficPoint{T: point.t, Down: point.down, Up: point.up})
+		}
+	}
 	if gw != nil && id == gw.ID {
 		detail.Adguard = l.pollAdGuard(ctx)
-		detail.Wireguard = l.pollWireGuard(clients)
+	}
+	if cfg.ReceivesRouterChecks(primaryID) {
+		if hasWGStats {
+			detail.Wireguard = &wgStats
+		}
 	} else {
 		// Backhaul real del AP: boca que enlaza con otro router + latencia
 		var uplink *EthPort

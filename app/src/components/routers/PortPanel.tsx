@@ -2,7 +2,7 @@ import { motion, useReducedMotion } from 'framer-motion'
 import { useTranslation } from 'react-i18next'
 import { Link } from 'react-router'
 import type { Router } from '@/data/mock'
-import type { WanInfo } from '@/data/types'
+import type { RouterWanInfo } from '@/data/types'
 import { SectionHeader } from '@/components/SectionHeader'
 import { getRouterExtras } from '@/components/routers/routerExtras'
 import type { EthPort, RouterExtras, SfpInfo } from '@/components/routers/routerExtras'
@@ -28,7 +28,7 @@ function fmtPortBps(bps?: number): string {
   return `${Math.round(bps)} bps`
 }
 
-function Jack({ port, index, wan }: { port: EthPort; index: number; wan?: WanInfo }) {
+function Jack({ port, index, wan }: { port: EthPort; index: number; wan?: RouterWanInfo }) {
   const { t } = useTranslation()
   const reduce = useReducedMotion()
   const isWan = port.id === 'wan'
@@ -267,9 +267,9 @@ function MiniStat({ label, value }: { label: string; value: string }) {
   )
 }
 
-export function PortPanel({ router, extras, className }: { router: Router; extras?: RouterExtras; className?: string }) {
+export function PortPanel({ router, extras, className, routerWan }: { router: Router; extras?: RouterExtras; className?: string; routerWan?: RouterWanInfo }) {
   const { t } = useTranslation()
-  const { isDemo, wan } = useNetPulse()
+  const { isDemo } = useNetPulse()
   const ex = extras ?? (isDemo ? getRouterExtras(router.id) : EMPTY_EXTRAS)
   const ports = ex.ethPorts
   const used = ports.filter((p) => p.up).length
@@ -291,7 +291,7 @@ export function PortPanel({ router, extras, className }: { router: Router; extra
           caben (móvil, chasis largos), scroll horizontal en vez de apilar. */}
       <div className="mt-4 flex flex-nowrap items-start gap-x-4 overflow-x-auto rounded-xl border border-border/70 bg-elevated/40 px-4 py-4">
         {wanPorts.map((p, i) => (
-          <Jack key={p.id} port={p} index={i} wan={wan} />
+          <Jack key={p.id} port={p} index={i} wan={routerWan} />
         ))}
         {wanPorts.length > 0 && lanPorts.length > 0 && (
           <div className="mx-1 h-[104px] w-px shrink-0 self-center bg-border/70" aria-hidden="true" />

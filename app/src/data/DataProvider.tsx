@@ -30,6 +30,8 @@ import type {
   OverviewBundle,
   Paged,
   Router,
+  RouterWanInfo,
+  RouterWireGuard,
   TimeRange,
   TopoSemantics,
   TrafficPoint,
@@ -95,6 +97,8 @@ export interface RouterDetailData {
   /** Solo en el gateway */
   adguard?: AdGuardStats
   wireguard?: WireGuardStats
+  wan?: RouterWanInfo
+  wanTraffic24h?: TrafficPoint[]
   /** VLANs del bridge (issue #315). Ausente si el router no tiene bridge vlan filtering. */
   vlans?: VlanPort[]
 }
@@ -102,9 +106,11 @@ export interface RouterDetailData {
 export interface NetPulseData {
   health: HealthScore
   wan: WanInfo
+  routerWans: Record<string, RouterWanInfo>
   traffic: Record<TimeRange, TrafficPoint[]>
   adguard: AdGuardStats
   wireguard: WireGuardStats
+  wireguards: RouterWireGuard[]
   routers: Router[]
   devices: Device[]
   deviceTotals: DeviceTotals
@@ -271,9 +277,11 @@ function initialBundle(): NetPulseData {
     {
       health: mockHealth,
       wan: mockWan,
+      routerWans: {},
       traffic: mockTraffic,
       adguard: mockAdGuard,
       wireguard: mockWireguard,
+      wireguards: [{ routerId: mockRouters.find((r) => r.roleBadge === 'Principal')?.id ?? mockRouters[0]?.id ?? '', stats: mockWireguard }],
       routers: mockRouters,
       devices: mockDevices,
       deviceTotals: mockDeviceTotals,
@@ -324,6 +332,8 @@ function emptyBundle(): NetPulseData {
       rules: 0,
     },
     wireguard: { interface: '', subnet: '', status: 'inactive', peers: [] },
+    routerWans: {},
+    wireguards: [],
     routers: [],
     devices: [],
     deviceTotals: { total: 0, online: 0, knownOffline: 0, newToday: 0 },
@@ -525,9 +535,11 @@ export function DataProvider({ children }: { children: React.ReactNode }) {
       ...prev,
       health: o.health,
       wan: o.wan,
+      routerWans: o.routerWans ?? {},
       traffic: o.traffic,
       adguard: o.adguard,
       wireguard: o.wireguard,
+      wireguards: o.wireguards ?? [{ routerId: o.routers.find((r) => r.roleBadge === 'Principal')?.id ?? '', stats: o.wireguard }],
       routers: o.routers,
       deviceTotals: o.deviceTotals,
       distributionNodes: o.distributionNodes ?? [],
@@ -1133,6 +1145,8 @@ export function DataProvider({ children }: { children: React.ReactNode }) {
         series?: PerfSeriesLive
         adguard?: AdGuardStats
         wireguard?: WireGuardStats
+        wan?: RouterWanInfo
+        wanTraffic24h?: TrafficPoint[]
         vlans?: VlanPort[]
       }
       // Live: extras SOLO del backend (datos reales); nunca el mock local
@@ -1149,11 +1163,13 @@ export function DataProvider({ children }: { children: React.ReactNode }) {
         series: json.series,
         adguard: json.adguard,
         wireguard: json.wireguard,
+        wan: json.wan,
+        wanTraffic24h: json.wanTraffic24h,
         vlans: json.vlans,
       }
     }
     // Demo: resolución local desde mock + routerExtras (misma firma async)
-    const { routers, devices, adguard, wireguard } = bundleRef.current
+    const { routers, devices, adguard, wireguard, wan, traffic } = bundleRef.current
     const router = routers.find((r) => r.id === id)
     if (!router) return null
     const isGateway = router.roleBadge === 'Principal'
@@ -1163,6 +1179,8 @@ export function DataProvider({ children }: { children: React.ReactNode }) {
       clients: devices.filter((d) => d.routerId === id),
       adguard: isGateway ? adguard : undefined,
       wireguard: isGateway ? wireguard : undefined,
+      wan: isGateway ? wan : undefined,
+      wanTraffic24h: isGateway ? traffic['24h'] : undefined,
     }
   }, [])
 

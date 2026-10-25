@@ -5,9 +5,9 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { useTranslation } from 'react-i18next'
 import { relTime } from '@/i18n'
 import type { PeerType, WGPeer } from '@/data/mock'
-import { useNetPulse } from '@/data/DataProvider'
+import type { WireGuardInstance, WireGuardStats } from '@/data/types'
 import { StatusPill } from '@/components/StatusPill'
-import { WG_TOTALS_30D, wgPeerExtras } from '@/components/routers/routerExtras'
+import { wgPeerExtras } from '@/components/routers/routerExtras'
 import { cn } from '@/lib/utils'
 
 const PEER_ICONS: Record<PeerType, LucideIcon> = {
@@ -102,11 +102,12 @@ function PeerRow({ peer, index }: { peer: WGPeer; index: number }) {
 }
 
 /** ⑥ WireGuard panel (router-detail.md §⑥) — id="wireguard". */
-export function WireGuardPanel() {
+export function WireGuardPanel({ stats }: { stats?: WireGuardStats }) {
   const { t } = useTranslation()
-  const { wireguard } = useNetPulse()
-  const peers = [...wireguard.peers].sort((a, b) => Number(b.active) - Number(a.active))
-  const connected = peers.filter((p) => p.active).length
+  const wireguard = stats ?? { interface: '', subnet: '', status: 'inactive', peers: [] }
+  const instances: WireGuardInstance[] = wireguard.instances ?? (wireguard.interface
+    ? [{ interface: wireguard.interface, status: wireguard.status, role: 'unknown', peers: wireguard.peers }]
+    : [])
 
   return (
     <section id="wireguard" className="scroll-mt-4 rounded-2xl border border-border bg-surface p-5 transition-shadow duration-500 md:p-6 lg:col-span-5">
@@ -118,33 +119,33 @@ export function WireGuardPanel() {
           </div>
           <h3 className="font-display text-h2 text-text-primary">WireGuard</h3>
         </div>
-        <StatusPill tone="tunnel" label={t('routerDetail.wireguard.serverActive')} />
+        <StatusPill tone={wireguard.status === 'active' ? 'tunnel' : 'warn'} label={wireguard.status === 'active' ? t('common.active') : t('common.status.offline')} />
       </div>
-      <p className="mt-1.5 font-mono text-caption text-text-muted">
-        {wireguard.interface} · {wireguard.subnet} · :51820
-      </p>
+      {wireguard.subnet && <p className="mt-1.5 font-mono text-caption text-text-muted">{wireguard.subnet}</p>}
 
-      {/* Stats */}
-      <div className="mt-4 grid grid-cols-2 gap-3">
-        <div className="rounded-xl bg-elevated/60 px-3.5 py-3">
-          <div className="text-[10px] font-medium uppercase tracking-[0.06em] text-text-muted">{t('routerDetail.wireguard.peersConnected')}</div>
-          <div className="mt-1 font-mono text-lg font-semibold text-text-primary">
-            {connected}<span className="text-text-muted">/{peers.length}</span>
-          </div>
-        </div>
-        <div className="rounded-xl bg-elevated/60 px-3.5 py-3">
-          <div className="text-[10px] font-medium uppercase tracking-[0.06em] text-text-muted">{t('routerDetail.wireguard.transfer30d')}</div>
-          <div className="mt-1 font-mono text-mono-sm font-semibold text-text-primary">
-            ↓ {WG_TOTALS_30D.rx} ↑ {WG_TOTALS_30D.tx}
-          </div>
-        </div>
-      </div>
-
-      {/* Lista de peers */}
-      <div className="mt-3 divide-y divide-border/50">
-        {peers.map((p, i) => (
-          <PeerRow key={p.id} peer={p} index={i} />
-        ))}
+      <div className="mt-4 space-y-3">
+        {instances.length === 0 && <p className="text-sm text-text-muted">{t('routerDetail.wireguard.noInstances')}</p>}
+        {instances.map((instance) => {
+          const peers = [...instance.peers].sort((a, b) => Number(b.active) - Number(a.active))
+          const connected = peers.filter((p) => p.active).length
+          const roleKey = instance.role === 'client' ? 'clientInstance'
+            : instance.role === 'server' ? 'serverInstance'
+              : instance.role === 'mixed' ? 'mixedInstance' : 'unknownInstance'
+          return (
+            <div key={instance.interface} className="rounded-xl border border-border bg-elevated/40 p-3.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-mono text-sm font-semibold text-text-primary">{instance.interface}</span>
+                <StatusPill tone={instance.status === 'active' ? 'tunnel' : 'muted'} label={t(`home.services.${roleKey}`)} />
+              </div>
+              <div className="mt-3 text-caption text-text-muted">
+                {t('routerDetail.wireguard.peersConnected')} <span className="font-mono text-text-primary">{connected}/{peers.length}</span>
+              </div>
+              <div className="mt-2 divide-y divide-border/50">
+                {peers.map((peer, i) => <PeerRow key={`${instance.interface}-${peer.id}`} peer={peer} index={i} />)}
+              </div>
+            </div>
+          )
+        })}
       </div>
     </section>
   )

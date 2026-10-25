@@ -826,14 +826,14 @@
       "trafficMbps": 0,
       "online": false,
       "sparkline": [],
+      "iconOverride": "BookOpen",
       "hostname": "kindle-paperwhite",
       "dhcpLease": "Expirado",
       "firstSeen": "hace 220 días",
       "traffic24hRx": "220 MB",
       "traffic24hTx": "8 MB",
       "adguard": true,
-      "group": "otros",
-      "iconOverride": "BookOpen"
+      "group": "otros"
     },
     {
       "id": "bombilla-1",
@@ -1653,14 +1653,14 @@
       },
       "attachTo": "living",
       "infra": "managed-switch",
+      "iconOverride": "Network",
       "hostname": "gs308e",
       "dhcpLease": "IP fija (reserva)",
       "firstSeen": "hace 300 días",
       "traffic24hRx": "64 MB",
       "traffic24hTx": "12 MB",
       "adguard": false,
-      "group": "red",
-      "iconOverride": "Network"
+      "group": "red"
     },
     {
       "id": "xbox-series-s",
@@ -2225,14 +2225,14 @@
         0.05
       ],
       "attachTo": "dist-flint2-lan3",
+      "iconOverride": "Printer",
       "hostname": "impresora-hp",
       "dhcpLease": "renueva en 5 h 22 min",
       "firstSeen": "hace 60 días",
       "traffic24hRx": "2,4 GB",
       "traffic24hTx": "120 MB",
       "adguard": true,
-      "group": "iot",
-      "iconOverride": "Printer"
+      "group": "iot"
     },
     {
       "id": "xbox-one",
@@ -2458,6 +2458,7 @@
     "peers": [
       {
         "id": "pixel-8-pro",
+        "localRole": "server",
         "name": "Pixel 8 Pro",
         "type": "movil",
         "tunnelIp": "10.0.0.2",
@@ -2468,6 +2469,7 @@
       },
       {
         "id": "macbook-air",
+        "localRole": "server",
         "name": "MacBook Air",
         "type": "portatil",
         "tunnelIp": "10.0.0.3",
@@ -2478,6 +2480,7 @@
       },
       {
         "id": "ipad-air",
+        "localRole": "server",
         "name": "iPad Air",
         "type": "tablet",
         "tunnelIp": "10.0.0.4",
@@ -2488,6 +2491,7 @@
       },
       {
         "id": "portatil-trabajo",
+        "localRole": "server",
         "name": "Portátil trabajo",
         "type": "portatil",
         "tunnelIp": "10.0.0.5",
@@ -2498,6 +2502,7 @@
       },
       {
         "id": "casa-familia",
+        "localRole": "server",
         "name": "Casa familia",
         "type": "sitio",
         "tunnelIp": "10.0.0.6",
@@ -2505,6 +2510,70 @@
         "lastHandshake": "hace 9 días",
         "rx": "12 GB",
         "tx": "4,2 GB"
+      }
+    ],
+    "instances": [
+      {
+        "interface": "wg0",
+        "status": "active",
+        "role": "server",
+        "peers": [
+          {
+            "id": "pixel-8-pro",
+            "localRole": "server",
+            "name": "Pixel 8 Pro",
+            "type": "movil",
+            "tunnelIp": "10.0.0.2",
+            "active": true,
+            "lastHandshake": "hace 38 s",
+            "rx": "1,2 GB",
+            "tx": "214 MB"
+          },
+          {
+            "id": "macbook-air",
+            "localRole": "server",
+            "name": "MacBook Air",
+            "type": "portatil",
+            "tunnelIp": "10.0.0.3",
+            "active": true,
+            "lastHandshake": "hace 1 min",
+            "rx": "640 MB",
+            "tx": "88 MB"
+          },
+          {
+            "id": "ipad-air",
+            "localRole": "server",
+            "name": "iPad Air",
+            "type": "tablet",
+            "tunnelIp": "10.0.0.4",
+            "active": false,
+            "lastHandshake": "hace 2 días",
+            "rx": "3,1 GB",
+            "tx": "402 MB"
+          },
+          {
+            "id": "portatil-trabajo",
+            "localRole": "server",
+            "name": "Portátil trabajo",
+            "type": "portatil",
+            "tunnelIp": "10.0.0.5",
+            "active": false,
+            "lastHandshake": "hace 6 h",
+            "rx": "812 MB",
+            "tx": "121 MB"
+          },
+          {
+            "id": "casa-familia",
+            "localRole": "server",
+            "name": "Casa familia",
+            "type": "sitio",
+            "tunnelIp": "10.0.0.6",
+            "active": false,
+            "lastHandshake": "hace 9 días",
+            "rx": "12 GB",
+            "tx": "4,2 GB"
+          }
+        ]
       }
     ]
   },

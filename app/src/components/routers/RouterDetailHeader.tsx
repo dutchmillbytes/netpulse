@@ -17,6 +17,7 @@ export function RouterDetailHeader({ router }: { router: Router }) {
   const { t } = useTranslation()
   const reduce = useReducedMotion()
   const isGateway = router.roleBadge === 'Principal'
+  const isRouter = router.roleBadge === 'Principal' || router.roleBadge === 'Secondary'
   const agent = useAgentFor(router.id)
   const pills = [
     { label: roleLabel(router.roleBadge), tone: 'accent' as const, pulse: false },
@@ -25,9 +26,9 @@ export function RouterDetailHeader({ router }: { router: Router }) {
       tone: (router.status === 'online' ? 'ok' : router.status === 'warn' ? 'warn' : 'danger') as 'ok' | 'warn' | 'danger',
       pulse: router.status !== 'online',
     },
-    ...(isGateway
+    ...(isRouter
       ? [
-          { label: 'AdGuard', tone: 'ok' as const, pulse: false },
+          ...(isGateway ? [{ label: 'AdGuard', tone: 'ok' as const, pulse: false }] : []),
           { label: 'WireGuard', tone: 'tunnel' as const, pulse: false },
         ]
       : []),

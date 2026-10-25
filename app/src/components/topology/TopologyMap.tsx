@@ -13,13 +13,13 @@ import { animate, motion, useReducedMotion } from 'framer-motion'
 import { Cloud, Laptop, Router as RouterIcon, Server, Smartphone, Tag } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { manufacturerLabel, relTime } from '@/i18n'
-import type { Device, DistributionNode, Router, WanInfo, WGPeer } from '@/data/mock'
+import type { Device, DistributionNode, Router, WGPeer } from '@/data/mock'
 import { fmtEs } from '@/data/mock'
 import { StatusPill } from '@/components/StatusPill'
 import { DEVICE_ICONS, deviceIcon } from '@/components/DeviceRow'
 import { fmtTemp, useTempUnit } from '@/lib/temperature'
 import { cn } from '@/lib/utils'
-import type { ChipNode, DistNodeView, RouterNode, TopologyModel } from './model'
+import type { ChipNode, DistNodeView, InternetNode, RouterNode, TopologyModel } from './model'
 import { COLOR, VB_H, VB_W, bandColor, linkColor, statusColor } from './model'
 
 /** Nombre preferente de un puerto: la etiqueta LuCI si existe, si no el id
@@ -74,12 +74,13 @@ function clampView(v: View): View {
 // sesión. "Restablecer vista" vuelve a INITIAL_VIEW y eso es lo que se
 // persiste, así que el borrado no hace falta.
 const VIEW_KEY = 'netpulse.topology.view'
+const MULTI_ROUTER_VIEW_KEY = 'netpulse.topology.view.multi-router'
 
 /** Carga la vista guardada validando tipos y aplicando clampView. null si no
  *  hay nada guardado o el valor está corrupto. */
-function loadSavedView(): View | null {
+function loadSavedView(key: string): View | null {
   try {
-    const raw = localStorage.getItem(VIEW_KEY)
+    const raw = localStorage.getItem(key)
     if (!raw) return null
     const v = JSON.parse(raw) as Partial<View>
     if (typeof v.x !== 'number' || typeof v.y !== 'number' || typeof v.w !== 'number' || typeof v.h !== 'number') {
@@ -97,7 +98,7 @@ function loadSavedView(): View | null {
 
 type TooltipData =
   | { kind: 'router'; id: string; router: Router; x: number; y: number }
-  | { kind: 'internet'; id: string; x: number; y: number }
+  | { kind: 'internet'; id: string; node: InternetNode; x: number; y: number }
   | { kind: 'peer'; id: string; peer: WGPeer; x: number; y: number }
   | { kind: 'peersOverflow'; id: string; peers: WGPeer[]; x: number; y: number }
   | { kind: 'ringOverflow'; id: string; routerName: string; devices: Device[]; x: number; y: number }
@@ -128,7 +129,7 @@ function MiniStat({ label, value, hot }: { label: string; value: string; hot?: b
 function TooltipCard({
   tip,
   touch,
-  wan,
+  multiRouter,
   routerName,
   onTagDevice,
   onPointerEnter,
@@ -136,7 +137,7 @@ function TooltipCard({
 }: {
   tip: TooltipState
   touch: boolean
-  wan: WanInfo
+  multiRouter: boolean
   /** nombre visible del router del que cuelga un nodo (D8: tooltip dist) */
   routerName: (id: string) => string
   /** etiquetar el dispositivo desde la propia tarjeta (#656 feedback: más
@@ -192,14 +193,15 @@ function TooltipCard({
       {tip.kind === 'internet' && (
         <div>
           <div className="flex items-center justify-between gap-2">
-            <span className="font-display text-sm font-semibold text-text-primary">Internet · {wan.isp}</span>
+            <span className="font-display text-sm font-semibold text-text-primary">{multiRouter ? `Internet · ${tip.node.router.name}` : `Internet · ${tip.node.wan.isp ?? 'WAN'}`}</span>
             <StatusPill tone="ok" label={t('common.status.online')} />
           </div>
+          {multiRouter && <div className="mt-1 text-caption text-text-muted">{t(tip.node.router.roleBadge === 'Secondary' ? 'common.roleSecondary' : 'common.rolePrimary')} WAN{tip.node.wan.isp ? ` · ${tip.node.wan.isp}` : ''}</div>}
           <div className="mt-2 grid grid-cols-2 gap-1.5">
-            <MiniStat label={t('routerDetail.wan.publicIp')} value={wan.publicIp} />
-            <MiniStat label={t('topology.plan')} value={wan.plan} />
-            <MiniStat label={t('home.latency')} value={`${wan.latencyMs} ms`} />
-            <MiniStat label={t('home.traffic.loss')} value={`${wan.lossPct} %`} />
+            <MiniStat label={t('routerDetail.wan.publicIp')} value={tip.node.wan.publicIp ?? '—'} />
+            <MiniStat label={t('topology.plan')} value={tip.node.wan.plan ?? (tip.node.wan.downMbps != null ? `${tip.node.wan.downMbps} Mbps` : '—')} />
+            <MiniStat label={t('home.latency')} value={tip.node.wan.latencyMs != null ? `${tip.node.wan.latencyMs} ms` : '—'} />
+            <MiniStat label={t('home.traffic.loss')} value={tip.node.wan.lossPct != null ? `${tip.node.wan.lossPct} %` : '—'} />
           </div>
         </div>
       )}
@@ -503,10 +505,13 @@ export function TopologyMap({
   const { t } = useTranslation()
   const reduce = useReducedMotion()
   const navigate = useNavigate()
-  const { chips, ctsByHost, ctCountByHost, distNodes, hiddenPeers, hypervisorSourceByHost, internetNode, links, peerNodes, relatedTo, ringOverflowChips, routerNodes, wan } = model
+  const { chips, ctsByHost, ctCountByHost, distNodes, hiddenPeers, hypervisorSourceByHost, internetNodes, links, peerNodes, relatedTo, ringOverflowChips, routerNodes } = model
   const containerRef = useRef<HTMLDivElement>(null)
   const svgRef = useRef<SVGSVGElement>(null)
-  const [initialView] = useState<View | null>(() => loadSavedView())
+  // A single-router zoom is often centered tightly on that router. Reusing it
+  // after adding another routing root hides the other router and its APs.
+  const viewKey = model.secondaryNodes.length ? MULTI_ROUTER_VIEW_KEY : VIEW_KEY
+  const [initialView] = useState<View | null>(() => loadSavedView(viewKey))
   const viewRef = useRef<View>(initialView ?? { ...INITIAL_VIEW })
   /** Guarda contra escrituras redundantes de localStorage (p. ej. los frames
    *  de la animación de "Restablecer vista"). Se inicializa con la vista
@@ -544,11 +549,11 @@ export function TopologyMap({
     if (l && l.x === v.x && l.y === v.y && l.w === v.w && l.h === v.h) return
     lastSavedView.current = v
     try {
-      localStorage.setItem(VIEW_KEY, JSON.stringify(v))
+      localStorage.setItem(viewKey, JSON.stringify(v))
     } catch {
       /* localStorage no disponible: solo vista en memoria */
     }
-  }, [])
+  }, [viewKey])
 
   const applyView = useCallback((v: View) => {
     const cv = clampView(v)
@@ -557,11 +562,13 @@ export function TopologyMap({
     persistView(cv)
   }, [persistView])
 
-  // El SVG declara INITIAL_VIEW en el JSX; al montar se aplica la vista
-  // guardada (issue #777) en cuanto existe el ref.
+  // Restore the relevant saved view when the topology gains or loses a router
+  // while this page is open, as well as when the map first mounts.
   useEffect(() => {
-    applyView(viewRef.current)
-  }, [applyView])
+    const saved = loadSavedView(viewKey)
+    lastSavedView.current = saved
+    applyView(saved ?? { ...INITIAL_VIEW })
+  }, [applyView, viewKey])
 
   const zoomAt = useCallback(
     (clientX: number, clientY: number, factor: number) => {
@@ -977,7 +984,7 @@ export function TopologyMap({
             si el wifi supera el aforo de los dos primeros) */}
         <g aria-hidden>
           {routerNodes.map((node) =>
-            (model.ringRadii.get(node.id) ?? (node.id === model.gatewayNode?.id ? [96, 130] : [82, 120])).map((r) => (
+            (model.ringRadii.get(node.id) ?? (node.router.roleBadge === 'Principal' || node.router.roleBadge === 'Secondary' ? [96, 130] : [82, 120])).map((r) => (
               <circle
                 key={`${node.id}-ring-${r}`}
                 cx={node.x}
@@ -1000,8 +1007,8 @@ export function TopologyMap({
             const isWg = link.kind === 'wg'
             const isWifiUp = link.kind === 'uplink' && link.wifi
             const drawDelay = link.kind === 'wan' ? 0.25 : link.kind === 'uplink' ? 0.8 + i * 0.12 : 1.5
-            const stroke = linkColor(link)
-            const baseOpacity = link.kind === 'wired' ? 0.45 : link.kind === 'dist' ? 0.55 : isWifiUp ? 0.8 : link.kind === 'uplink' ? 0.55 : 0.9
+            const stroke = link.active === false ? COLOR.warn : linkColor(link)
+            const baseOpacity = link.active === false ? 0.45 : link.kind === 'wired' ? 0.45 : link.kind === 'dist' ? 0.55 : isWifiUp ? 0.8 : link.kind === 'uplink' ? 0.55 : 0.9
             return (
               <g key={link.id}>
                 {/* base */}
@@ -1020,7 +1027,7 @@ export function TopologyMap({
                   transition={reduce ? { duration: 0 } : { delay: drawDelay * T, duration: 0.4, ease: 'easeOut' }}
                 />
                 {/* flujo del dash en túneles WG */}
-                {isWg && !reduce && (
+                {isWg && link.active !== false && !reduce && (
                   <motion.path
                     d={link.d}
                     fill="none"
@@ -1083,32 +1090,33 @@ export function TopologyMap({
               )}
         </g>
 
-        {/* ------------------------- Internet ------------------------- */}
-        <g
+        {/* ------------------------- One WAN endpoint per routing root ------ */}
+        {internetNodes.map((internetNode) => <g
+          key={internetNode.id}
           transform={`translate(${internetNode.x} ${internetNode.y})`}
           className="cursor-pointer outline-none"
           role="button"
           tabIndex={0}
-          aria-label={t('topology.internetAria', { isp: wan.isp, plan: wan.plan })}
+          aria-label={t('topology.internetAria', { isp: internetNode.wan.isp ?? internetNode.router.name, plan: internetNode.wan.plan ?? 'WAN' })}
           onPointerEnter={(e) =>
-            handleNodeHover({ kind: 'internet', id: 'internet', x: internetNode.x, y: internetNode.y + 46 }, e)
+            handleNodeHover({ kind: 'internet', id: internetNode.id, node: internetNode, x: internetNode.x, y: internetNode.y + 46 }, e)
           }
           onPointerLeave={closeHover}
-          onFocus={() => handleNodeFocus({ kind: 'internet', id: 'internet', x: internetNode.x, y: internetNode.y + 46 })}
+          onFocus={() => handleNodeFocus({ kind: 'internet', id: internetNode.id, node: internetNode, x: internetNode.x, y: internetNode.y + 46 })}
           onBlur={closeHover}
           onClick={(e) =>
-            nodeClick(e, { kind: 'internet', id: 'internet', x: internetNode.x, y: internetNode.y + 46 })
+            nodeClick(e, { kind: 'internet', id: internetNode.id, node: internetNode, x: internetNode.x, y: internetNode.y + 46 })
           }
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault()
-              handleNodeClick({ kind: 'internet', id: 'internet', x: internetNode.x, y: internetNode.y + 46 })
+              handleNodeClick({ kind: 'internet', id: internetNode.id, node: internetNode, x: internetNode.x, y: internetNode.y + 46 })
             }
           }}
         >
           <motion.g
             initial={reduce ? { opacity: 1 } : { opacity: 0, scale: 0 }}
-            animate={{ opacity: nodeOpacity('internet'), scale: 1 }}
+            animate={{ opacity: nodeOpacity(internetNode.id), scale: 1 }}
             transition={reduce ? { duration: 0.2 } : { ...springPop(0), opacity: { duration: 0.2 } }}
             style={{ transformBox: 'fill-box', transformOrigin: 'center' }}
           >
@@ -1132,11 +1140,11 @@ export function TopologyMap({
             <circle r={28} fill="rgb(var(--elevated))" stroke={COLOR.ok} strokeWidth={2} />
             <Cloud x={-12} y={-10} width={24} height={20} className="text-ok" strokeWidth={1.75} aria-hidden />
           </motion.g>
-        </g>
+        </g>)}
 
         {/* ------------------------- Routers ------------------------- */}
         {routerNodes.map((node, i) => {
-          const isGw = node.router.roleBadge === 'Principal'
+          const isGw = node.router.roleBadge === 'Principal' || node.router.roleBadge === 'Secondary'
           const isWarn = node.router.status === 'warn'
           const isOffline = node.router.status === 'offline'
           const glowFilter = isOffline ? 'url(#glow-danger)' : isWarn ? 'url(#glow-warn)' : undefined
@@ -1435,21 +1443,26 @@ export function TopologyMap({
           pointerEvents="none"
           aria-hidden={!showLabels}
         >
-          {/* Internet */}
-          <LabelText x={548} y={54} anchor="start" delay={2.0 * T} reduce={reduce ?? false}
-            title={`Internet · ${wan.isp}`} sub={t('routerDetail.wan.fiber', { plan: wan.plan })} />
-          {/* Gateway */}
-          {model.gatewayNode && (
-            <LabelText x={model.gatewayNode.label.x} y={model.gatewayNode.label.y} anchor={model.gatewayNode.label.anchor}
-              delay={2.05 * T} reduce={reduce ?? false}
-              title={model.gatewayNode.router.name}
-              sub={`${model.gatewayNode.router.modelShort} · ${model.gatewayNode.router.roleBadge} · ${t('common.clientsCount', { count: model.gatewayNode.router.clients })}`} />
-          )}
+          {/* Separate WAN labels for each routing root. */}
+          {internetNodes.map((node) => <LabelText key={node.id}
+            x={internetNodes.length > 1 ? node.x : 548} y={internetNodes.length > 1 ? node.y - 64 : 54}
+            anchor={internetNodes.length > 1 ? 'middle' : 'start'} delay={2.0 * T} reduce={reduce ?? false}
+            title={internetNodes.length > 1 ? 'Internet' : `Internet · ${node.wan.isp ?? 'WAN'}`}
+            sub={internetNodes.length > 1
+              ? `${t(node.router.roleBadge === 'Secondary' ? 'common.roleSecondary' : 'common.rolePrimary')} WAN`
+              : t('routerDetail.wan.fiber', { plan: node.wan.plan ?? '—' })} />)}
+          {/* Routing roots */}
+          {[...(model.gatewayNode ? [model.gatewayNode] : []), ...model.secondaryNodes].map((node, i) => (
+            <LabelText key={node.id} x={node.label.x} y={node.label.y} anchor={node.label.anchor}
+              delay={(2.05 + i * 0.03) * T} reduce={reduce ?? false}
+              title={node.router.name}
+              sub={`${node.router.modelShort} · ${t(node.router.roleBadge === 'Secondary' ? 'common.roleSecondary' : 'common.rolePrimary')} · ${t('common.clientsCount', { count: node.router.clients })}`} />
+          ))}
           {/* APs */}
           {model.apNodes.map((node, i) => (
             <LabelText key={node.id} x={node.label.x} y={node.label.y} anchor={node.label.anchor}
               delay={(2.1 + i * 0.03) * T} reduce={reduce ?? false}
-              title={node.router.name}
+              title={node.displayName ?? node.router.name}
               sub={node.router.status === 'warn'
                 ? `${t('common.clientsCount', { count: node.router.clients })} · ${t('common.status.warn')}`
                 : t('common.clientsCount', { count: node.router.clients })}
@@ -1520,7 +1533,7 @@ export function TopologyMap({
         <TooltipCard
           tip={tooltip}
           touch={!hoverCapable}
-          wan={wan}
+          multiRouter={model.secondaryNodes.length > 0}
           routerName={routerName}
           onTagDevice={
             onTagDevice

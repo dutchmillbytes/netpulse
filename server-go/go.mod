@@ -1,6 +1,6 @@
 module github.com/gnacho/netpulse/server-go
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/SherClockHolmes/webpush-go v1.4.0

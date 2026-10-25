@@ -32,7 +32,8 @@ export default function RouterDetail() {
   const { routers, alerts, getRouterDetail, isDemo } = useNetPulse()
   const [tempUnit] = useTempUnit()
   const router = routers.find((r) => r.id === id)
-  const isGateway = router?.roleBadge === 'Principal'
+  const isPrimary = router?.roleBadge === 'Principal'
+  const isRouter = router?.roleBadge === 'Principal' || router?.roleBadge === 'Secondary'
   const [detail, setDetail] = useState<RouterDetailData | null>(null)
   const [hkBusy, setHkBusy] = useState(false)
   const [hkDone, setHkDone] = useState(false)
@@ -190,14 +191,15 @@ export default function RouterDetail() {
       </div>
 
       {/* ④ WAN & Latencia (gateway) / Backhaul (APs) */}
-      {isGateway ? <WanLatency /> : <BackhaulPanel router={router} extras={detail?.extras} />}
+      {isRouter ? <WanLatency wan={detail?.wan} traffic={detail?.wanTraffic24h} /> : <BackhaulPanel router={router} extras={detail?.extras} />}
 
       {/* ⑤⑥ Servicios + Puertos (gateway) / Radios + Puertos (APs) */}
-      {isGateway ? (
+      {isRouter ? (
         <>
-          <AdGuardPanel />
-          <WireGuardPanel />
-          <PortPanel router={router} extras={detail?.extras} className="lg:col-span-12" />
+          {isPrimary && <AdGuardPanel />}
+          <WireGuardPanel stats={detail?.wireguard} />
+          <PortPanel router={router} extras={detail?.extras} routerWan={detail?.wan} className="lg:col-span-12" />
+          <RadiosPorts router={router} extras={detail?.extras} hidePorts />
         </>
       ) : (
         <RadiosPorts router={router} extras={detail?.extras} />

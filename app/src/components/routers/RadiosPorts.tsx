@@ -11,7 +11,7 @@ import { EMPTY_EXTRAS, useNetPulse } from '@/data/DataProvider'
 import { cn } from '@/lib/utils'
 
 /** ⑤⑥ variante OpenWrt — Radios WiFi (7) + Puertos (5) (router-detail.md §Variante). */
-export function RadiosPorts({ router, extras }: { router: Router; extras?: RouterExtras }) {
+export function RadiosPorts({ router, extras, hidePorts = false }: { router: Router; extras?: RouterExtras; hidePorts?: boolean }) {
   const { t } = useTranslation()
   const { isDemo } = useNetPulse()
   const ex = extras ?? (isDemo ? getRouterExtras(router.id) : EMPTY_EXTRAS)
@@ -72,7 +72,7 @@ export function RadiosPorts({ router, extras }: { router: Router; extras?: Route
       )}
 
       {/* Puertos Ethernet (panel visual de bocas RJ45) */}
-      <PortPanel router={router} extras={extras} className={hasRadios ? 'lg:col-span-5' : 'lg:col-span-12'} />
+      {!hidePorts && <PortPanel router={router} extras={extras} className={hasRadios ? 'lg:col-span-5' : 'lg:col-span-12'} />}
     </>
   )
 }

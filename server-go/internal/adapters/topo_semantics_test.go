@@ -12,9 +12,8 @@ import (
 // (revisado a mano contra model.ts @ audit/v2-main):
 //   - wan + 3 uplinks (living/estudio con puerto LLDP del gateway; patio wifi)
 //   - 2 enlaces dist (switch inferido del gateway y GS308E managed del Salón)
-//   - cableados directos: nas/mac-mini/hue-hub anclados al GATEWAY (mac-mini y
-//     hue-hub son de Estudio pero no tienen evidencia: ni attachTo ni puerto
-//     FDB → regla de anclaje al gateway), ps5 al Salón, pve (host hipervisor)
+//   - cableados directos: nas y pve en el gateway; mac-mini/hue-hub en
+//     Estudio según su routerId aunque no tengan puerto FDB; ps5 en Salón
 //   - 8 clientes tras el switch inferido + 3 tras el GS308E + 10 CTs del pve
 //   - 2 túneles WG (los 2 peers activos)
 //   - El GS308E (switch-netgear) NO genera chips/enlaces: su MAC es la
@@ -33,9 +32,9 @@ func TestTopoSemanticsGoldenCanon(t *testing.T) {
 		{From: "flint2", To: "dist-flint2-lan3", Kind: "dist", Port: "lan3"},
 		{From: "living", To: "dist-living-lan3", Kind: "dist", Port: "lan3"},
 		{From: "flint2", To: "nas-synology", Kind: "wired", Port: "lan4"},
-		{From: "flint2", To: "mac-mini", Kind: "wired"},
-		{From: "flint2", To: "hue-hub", Kind: "wired"},
 		{From: "living", To: "ps5", Kind: "wired", Port: "lan1"},
+		{From: "estudio", To: "mac-mini", Kind: "wired"},
+		{From: "estudio", To: "hue-hub", Kind: "wired"},
 		{From: "flint2", To: "pve", Kind: "wired", Port: "lan5"},
 		{From: "dist-flint2-lan3", To: "pc-sobremesa", Kind: "wired"},
 		{From: "dist-flint2-lan3", To: "raspberry-pi", Kind: "wired"},
@@ -66,7 +65,7 @@ func TestTopoSemanticsGoldenCanon(t *testing.T) {
 	}
 
 	wantRings := map[string][]string{
-		"flint2": {"nas-synology", "mac-mini", "hue-hub", "pve",
+		"flint2": {"nas-synology", "pve",
 			"pixel-8-pro", "iphone-ana", "macbook-pro", "pixel-7",
 			"timbre-nest", "enchufe-lavadora"},
 		"living": {"ps5",
@@ -74,7 +73,7 @@ func TestTopoSemanticsGoldenCanon(t *testing.T) {
 			"galaxy-s23", "nintendo-switch", "portatil-invitado",
 			"bombilla-1", "bombilla-2", "bombilla-3", "bombilla-4", "bombilla-5",
 			"bombilla-6", "echo-dot"},
-		"estudio": {"macbook-air", "ipad-pro", "iphone-trabajo",
+		"estudio": {"mac-mini", "hue-hub", "macbook-air", "ipad-pro", "iphone-trabajo",
 			"nest-mini", "enchufe-ventilador", "sonos-one"},
 		"patio": {"robot-aspirador", "camara-porche", "camara-jardin",
 			"sensor-riego", "enchufe-calefactor"},
@@ -187,5 +186,48 @@ func TestTopoSemanticsDeviceHubBajoDistnode(t *testing.T) {
 		if ctLinks[ct] != 1 {
 			t.Errorf("CT %s debe colgar del host una vez, got %d", ct, ctLinks[ct])
 		}
+	}
+}
+
+func TestTopoSemanticsSecondaryRouterSiteAndSharedPeer(t *testing.T) {
+	routers := []Router{
+		{ID: "router-a", Name: "router.nl.example.home", IP: "10.49.1.254", RoleBadge: "Principal"},
+		{ID: "router-b", Name: "router.th.example.home", IP: "router.th.example.home", RoleBadge: "Secondary"},
+		{ID: "ap-a", Name: "ap-2.nl.example.home", IP: "ap-2.nl.example.home", RoleBadge: "AP"},
+		{ID: "ap-b", Name: "ap-2.th.example.home", IP: "ap-2.th.example.home", RoleBadge: "AP"},
+		{ID: "ap-a3", Name: "ap-3.nl.example.home", IP: "ap-3.nl.example.home", RoleBadge: "AP"},
+	}
+	devices := []Device{
+		{ID: "ap-b-client", Name: "ap-2", RouterID: "router-b", Band: "cable", Online: true},
+		{ID: "ap-a-client", Name: "ap-2", RouterID: "router-a", Band: "cable", Online: true},
+		{ID: "ap-a3-conflict", Name: "ap-3", RouterID: "router-b", Band: "cable", Online: true},
+	}
+	wg := []RouterWireGuard{
+		{RouterID: "router-a", Stats: WireGuardStats{Status: "active", Peers: []WGPeer{{ID: "peer-1", Name: "VPS", KeyFingerprint: "samekey", Active: true}}}},
+		{RouterID: "router-b", Stats: WireGuardStats{Status: "active", Peers: []WGPeer{{ID: "peer-1", Name: "VPS", KeyFingerprint: "samekey", Active: false}}}},
+	}
+	sem := BuildTopoSemanticsWithWireguards(routers, devices, wg, nil)
+	if sem.RouterParents["ap-a"] != "router-a" || sem.RouterParents["ap-b"] != "router-b" || sem.RouterParents["ap-a3"] != "router-a" {
+		t.Fatalf("AP parents: %+v", sem.RouterParents)
+	}
+	links := map[string]bool{}
+	for _, link := range sem.Links {
+		links[link.Kind+":"+link.From+":"+link.To] = true
+	}
+	for _, want := range []string{
+		"wan:internet-router-a:router-a", "wan:internet-router-b:router-b",
+		"uplink:router-a:ap-a", "uplink:router-b:ap-b",
+		"wired:router-a:ap-a-client", "wired:router-b:ap-b-client",
+		"wg:router-a:peer-key-samekey", "wg:router-b:peer-key-samekey",
+	} {
+		if !links[want] {
+			t.Errorf("missing %s in %+v", want, sem.Links)
+		}
+	}
+	if links["uplink:router-a:router-b"] || links["uplink:router-a:ap-b"] {
+		t.Fatalf("fictional physical uplink: %+v", sem.Links)
+	}
+	if topologyPeerID("router-a", WGPeer{ID: "peer-1"}) == topologyPeerID("router-b", WGPeer{ID: "peer-1"}) {
+		t.Fatal("router-local peer IDs must not merge without a public key")
 	}
 }

@@ -120,21 +120,35 @@ type AdGuardStats struct {
 
 // WGPeer es un peer WireGuard (bytes formateados ES: "1,2 GB").
 type WGPeer struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	Type          string `json:"type"`
-	TunnelIP      string `json:"tunnelIp"`
-	Active        bool   `json:"active"`
-	LastHandshake string `json:"lastHandshake"`
-	Rx            string `json:"rx"`
-	Tx            string `json:"tx"`
+	ID             string `json:"id"`
+	PublicKey      string `json:"-"`
+	KeyFingerprint string `json:"keyFingerprint,omitempty"`
+	Interface      string `json:"interface,omitempty"`
+	LocalRole      string `json:"localRole,omitempty"` // client initiates toward this peer; server accepts it
+	Name           string `json:"name"`
+	Type           string `json:"type"`
+	TunnelIP       string `json:"tunnelIp"`
+	Active         bool   `json:"active"`
+	LastHandshake  string `json:"lastHandshake"`
+	Rx             string `json:"rx"`
+	Tx             string `json:"tx"`
 }
 
 // WireGuardStats (quirk: Status siempre "active" si `wg show` respondió).
 type WireGuardStats struct {
+	Interface string              `json:"interface"`
+	Subnet    string              `json:"subnet"`
+	Status    string              `json:"status"` // "active"|"inactive"
+	Peers     []WGPeer            `json:"peers"`
+	Instances []WireGuardInstance `json:"instances"`
+}
+
+// WireGuardInstance preserves one local interface and its operational role.
+// WireGuard itself is peer-to-peer; role is inferred from configured endpoints.
+type WireGuardInstance struct {
 	Interface string   `json:"interface"`
-	Subnet    string   `json:"subnet"`
-	Status    string   `json:"status"` // "active"|"inactive"
+	Status    string   `json:"status"`
+	Role      string   `json:"role"` // "client"|"server"|"mixed"|"unknown"
 	Peers     []WGPeer `json:"peers"`
 }
 
@@ -371,6 +385,9 @@ type TopologyOverride struct {
 // peers ocultos llegan calculados.
 type TopoSemantics struct {
 	Links []TopoLink `json:"links"`
+	// RouterParents contains only observed or unambiguous AP/switch uplinks.
+	// Routing roots are deliberately absent: a shared WG peer is not a cable.
+	RouterParents map[string]string `json:"routerParents,omitempty"`
 	// Rings: routerId → ids de Device en su anillo (orden: cableados primero,
 	// luego por banda 5GHz/2.4GHz, estable).
 	Rings map[string][]string `json:"rings"`
@@ -380,10 +397,11 @@ type TopoSemantics struct {
 
 // TopoLink es un enlace semántico del mapa (sin geometría).
 type TopoLink struct {
-	From string `json:"from"` // id: router | device | distnode | "internet" | "peer-<wgPeerId>"
-	To   string `json:"to"`
-	Kind string `json:"kind"`           // "wan"|"uplink"|"wired"|"dist"|"wg"
-	Port string `json:"port,omitempty"` // puerto físico si aplica
+	From      string `json:"from"` // id: router | device | distnode | "internet" | "peer-<wgPeerId>"
+	To        string `json:"to"`
+	Kind      string `json:"kind"`                // "wan"|"uplink"|"wired"|"dist"|"wg"
+	Port      string `json:"port,omitempty"`      // puerto físico si aplica
+	Interface string `json:"interface,omitempty"` // WG interface on the source router
 }
 
 // RoamingDaemon clasifica el daemon de roaming/band-steering activo en la
@@ -408,16 +426,18 @@ type RoamingAnomaly struct {
 
 // Overview es el bundle completo (SPEC §7.8). Ts en SEGUNDOS.
 type Overview struct {
-	Health       HealthScore    `json:"health"`
-	WAN          WAN            `json:"wan"`
-	Traffic      TrafficByRange `json:"traffic"`
-	Adguard      AdGuardStats   `json:"adguard"`   // fallback inactivo si no configurado (nunca null en live)
-	Wireguard    WireGuardStats `json:"wireguard"` // fallback inactivo si error SSH
-	Routers      []Router       `json:"routers"`
-	DeviceTotals DeviceTotals   `json:"deviceTotals"`
-	TopDevices   []Device       `json:"topDevices"` // 5 por trafficMbps desc
-	Alerts       []AlertEvent   `json:"alerts"`
-	UnreadAlerts int            `json:"unreadAlerts"`
+	Health       HealthScore          `json:"health"`
+	WAN          WAN                  `json:"wan"`
+	RouterWANs   map[string]RouterWAN `json:"routerWans,omitempty"`
+	Traffic      TrafficByRange       `json:"traffic"`
+	Adguard      AdGuardStats         `json:"adguard"`   // fallback inactivo si no configurado (nunca null en live)
+	Wireguard    WireGuardStats       `json:"wireguard"` // fallback inactivo si error SSH
+	Wireguards   []RouterWireGuard    `json:"wireguards,omitempty"`
+	Routers      []Router             `json:"routers"`
+	DeviceTotals DeviceTotals         `json:"deviceTotals"`
+	TopDevices   []Device             `json:"topDevices"` // 5 por trafficMbps desc
+	Alerts       []AlertEvent         `json:"alerts"`
+	UnreadAlerts int                  `json:"unreadAlerts"`
 	// ServerUptimeSec: segundos desde el arranque del proceso server. Lo usa
 	// el frontend para el período de gracia post-arranque (#887): justo tras
 	// un reinicio los agentes aún no han vuelto a empujar y no debe saltar
@@ -453,6 +473,12 @@ type Overview struct {
 	// VM: versión del view-model (SPEC-65 D65-4). SIEMPRE presente.
 	VM int   `json:"vm"`
 	Ts int64 `json:"ts"` // floor(now/1000) — SEGUNDOS
+}
+
+// RouterWireGuard keeps each router's tunnel state separate in the overview.
+type RouterWireGuard struct {
+	RouterID string         `json:"routerId"`
+	Stats    WireGuardStats `json:"stats"`
 }
 
 // UsteerOverview indica si la red tiene usteer (roaming/band-steering)
@@ -576,6 +602,10 @@ type RouterDetail struct {
 	Series   PerfSeries `json:"series"`
 	Clients  []Device   `json:"clients"`
 	Extras   any        `json:"extras"`
+	// WAN is measured on this router, including secondary routers. It is
+	// separate from the overview WAN, which always belongs to the gateway.
+	WAN           *RouterWAN     `json:"wan,omitempty"`
+	WANTraffic24h []TrafficPoint `json:"wanTraffic24h,omitempty"`
 	// Vlans: VLANs del bridge (issue #315). nil = sin datos (demo/routers
 	// sin bridge vlan filtering); slice vacio = sondeo sin VLANs.
 	Vlans []VlanPort `json:"vlans,omitempty"`
@@ -586,6 +616,17 @@ type RouterDetail struct {
 	WANLatency       *WANLatency     `json:"wanLatency,omitempty"`
 	WGPeerExtras     any             `json:"wgPeerExtras,omitempty"`
 	WGTotals30d      *WGTotals       `json:"wgTotals30d,omitempty"`
+}
+
+type RouterWAN struct {
+	Proto     string   `json:"proto,omitempty"`
+	PublicIP  string   `json:"publicIp,omitempty"`
+	Gateway   string   `json:"gateway,omitempty"`
+	DNS       []string `json:"dns,omitempty"`
+	DownMbps  *float64 `json:"downMbps,omitempty"`
+	UpMbps    *float64 `json:"upMbps,omitempty"`
+	LatencyMs *float64 `json:"latencyMs,omitempty"`
+	LossPct   *float64 `json:"lossPct,omitempty"`
 }
 
 // AdGuardHour es un punto de la serie horaria AdGuard del detalle del gateway
@@ -835,6 +876,7 @@ type RouterConfig struct {
 	Host      string `json:"host"`
 	Type      string `json:"type"` // "glinet"|"openwrt"
 	IsGateway bool   `json:"is_gateway"`
+	IsRouter  bool   `json:"is_router"`
 	AgentOnly bool   `json:"agent_only"`
 	CreatedAt int64  `json:"created_at"` // epoch ms
 	// FirmwareTarget: versión objetivo configurada por el admin (issue #241).
@@ -859,6 +901,12 @@ type RouterConfig struct {
 	// de este router. NULL/ausente = DefaultTempThreshold (65). Un router que
 	// corre más caliente sube el suyo sin ocultar problemas en los más frescos.
 	TempThreshold *int `json:"temp_threshold,omitempty"`
+}
+
+// Every router-role device receives router checks; IsGateway only selects the
+// network's default gateway. The implicit primary preserves older configs.
+func (c RouterConfig) ReceivesRouterChecks(primaryID string) bool {
+	return c.IsRouter || c.IsGateway || (primaryID != "" && c.ID == primaryID)
 }
 
 // TempThresholdValue resuelve el umbral efectivo de temperatura alta (°C) de

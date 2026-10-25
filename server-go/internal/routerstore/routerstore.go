@@ -9,6 +9,7 @@ package routerstore
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"os/exec"
 	"regexp"
@@ -24,10 +25,21 @@ import (
 
 const probeTimeout = 4 * time.Second
 
+var ErrInvalidRole = errors.New("a router-role device must be SSH-capable OpenWrt or GL.iNet unless it is the primary gateway")
+
+// ValidateRole keeps the new role independent of platform/transport while
+// rejecting combinations that cannot provide the router probes.
+func ValidateRole(isGateway, isRouter, agentOnly, snmpEnabled bool, typ string) error {
+	if (isGateway && !isRouter) || (isRouter && !isGateway && (agentOnly || snmpEnabled || (typ != "openwrt" && typ != "glinet"))) {
+		return ErrInvalidRole
+	}
+	return nil
+}
+
 // ListRouters devuelve la tabla routers ordenada is_gateway DESC,
 // created_at ASC, con is_gateway como booleano.
 func ListRouters(db *sql.DB) []adapters.RouterConfig {
-	rows, err := db.Query("SELECT id, name, host, type, is_gateway, agent_only, firmware_target, created_at, snmp_enabled, snmp_community, snmp_port, snmp_poll_interval, ssh_port, temp_threshold, console_polling FROM routers ORDER BY is_gateway DESC, created_at ASC")
+	rows, err := db.Query("SELECT id, name, host, type, is_gateway, agent_only, firmware_target, created_at, snmp_enabled, snmp_community, snmp_port, snmp_poll_interval, ssh_port, temp_threshold, console_polling, is_secondary_router FROM routers ORDER BY is_gateway DESC, created_at ASC")
 	if err != nil {
 		return []adapters.RouterConfig{}
 	}
@@ -35,10 +47,10 @@ func ListRouters(db *sql.DB) []adapters.RouterConfig {
 	out := []adapters.RouterConfig{}
 	for rows.Next() {
 		var r adapters.RouterConfig
-		var gw, ao, snmpEn, snmpPort, snmpInterval, sshPort, consolePoll int
+		var gw, ao, snmpEn, snmpPort, snmpInterval, sshPort, consolePoll, secondary int
 		var name, ft, snmpComm sql.NullString
 		var tt sql.NullInt64
-		if err := rows.Scan(&r.ID, &name, &r.Host, &r.Type, &gw, &ao, &ft, &r.CreatedAt, &snmpEn, &snmpComm, &snmpPort, &snmpInterval, &sshPort, &tt, &consolePoll); err != nil {
+		if err := rows.Scan(&r.ID, &name, &r.Host, &r.Type, &gw, &ao, &ft, &r.CreatedAt, &snmpEn, &snmpComm, &snmpPort, &snmpInterval, &sshPort, &tt, &consolePoll, &secondary); err != nil {
 			continue
 		}
 		// DEFAULT 1 de la migración, pero una fila insertada antes de la
@@ -48,6 +60,7 @@ func ListRouters(db *sql.DB) []adapters.RouterConfig {
 		r.Name = name.String
 		r.FirmwareTarget = ft.String
 		r.IsGateway = gw == 1
+		r.IsRouter = gw == 1 || secondary == 1
 		r.AgentOnly = ao == 1
 		r.SnmpEnabled = snmpEn == 1
 		r.SnmpCommunity = snmpComm.String
@@ -133,6 +146,7 @@ type AddInput struct {
 	Host      string
 	Type      string // default "openwrt"
 	IsGateway bool
+	IsRouter  bool
 	AgentOnly bool
 	// FirmwareTarget: versión objetivo (issue #241). "" = sin comprobar.
 	FirmwareTarget string
@@ -155,6 +169,10 @@ func AddRouter(db *sql.DB, in AddInput) (adapters.RouterConfig, error) {
 	if in.Type == "" {
 		in.Type = "openwrt"
 	}
+	in.IsRouter = in.IsRouter || in.IsGateway
+	if err := ValidateRole(in.IsGateway, in.IsRouter, in.AgentOnly, in.SnmpEnabled, in.Type); err != nil {
+		return adapters.RouterConfig{}, err
+	}
 	id := uniqueId(db, in.Name, in.Host)
 	now := time.Now().UnixMilli()
 	name := in.Name
@@ -167,7 +185,7 @@ func AddRouter(db *sql.DB, in AddInput) (adapters.RouterConfig, error) {
 	}
 	defer tx.Rollback()
 	if in.IsGateway {
-		if _, err := tx.Exec("UPDATE routers SET is_gateway = 0"); err != nil {
+		if _, err := tx.Exec("UPDATE routers SET is_gateway = 0, is_secondary_router = 1 WHERE is_gateway = 1"); err != nil {
 			return adapters.RouterConfig{}, err
 		}
 	}
@@ -200,8 +218,8 @@ func AddRouter(db *sql.DB, in AddInput) (adapters.RouterConfig, error) {
 		consolePoll = 0
 	}
 	if _, err := tx.Exec(
-		"INSERT INTO routers (id, name, host, type, is_gateway, agent_only, firmware_target, created_at, snmp_enabled, snmp_community, snmp_port, snmp_poll_interval, ssh_port, console_polling) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		id, name, in.Host, in.Type, gw, ao, in.FirmwareTarget, now, snmpEn, in.SnmpCommunity, snmpPort, snmpInterval, sshPort, consolePoll,
+		"INSERT INTO routers (id, name, host, type, is_gateway, agent_only, firmware_target, created_at, snmp_enabled, snmp_community, snmp_port, snmp_poll_interval, ssh_port, console_polling, is_secondary_router) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		id, name, in.Host, in.Type, gw, ao, in.FirmwareTarget, now, snmpEn, in.SnmpCommunity, snmpPort, snmpInterval, sshPort, consolePoll, in.IsRouter && !in.IsGateway,
 	); err != nil {
 		return adapters.RouterConfig{}, err
 	}
@@ -233,6 +251,7 @@ type UpdateInput struct {
 	Host      *string
 	Type      *string
 	IsGateway *bool
+	IsRouter  *bool
 	AgentOnly *bool
 	// FirmwareTarget: versión objetivo (issue #241). nil = no tocar; "" = limpiar.
 	FirmwareTarget *string
@@ -253,27 +272,55 @@ type UpdateInput struct {
 
 // UpdateRouter actualiza un router existente por id. Si IsGateway pasa a true,
 // el flag se quita del resto (un solo gateway, transacción). Si el router no
-// existe devuelve false (caller responde 404).
-func UpdateRouter(db *sql.DB, id string, in UpdateInput) (adapters.RouterConfig, bool) {
+// existe devuelve sql.ErrNoRows (caller responde 404).
+func UpdateRouter(db *sql.DB, id string, in UpdateInput) (adapters.RouterConfig, error) {
 	tx, err := db.Begin()
 	if err != nil {
-		return adapters.RouterConfig{}, false
+		return adapters.RouterConfig{}, err
 	}
 	defer tx.Rollback()
 
-	var exists int
-	if err := tx.QueryRow("SELECT 1 FROM routers WHERE id = ?", id).Scan(&exists); err != nil {
-		return adapters.RouterConfig{}, false
+	var gateway, secondary, agentOnly, snmpEnabled bool
+	var typ string
+	if err := tx.QueryRow("SELECT is_gateway, is_secondary_router, agent_only, snmp_enabled, type FROM routers WHERE id = ?", id).Scan(&gateway, &secondary, &agentOnly, &snmpEnabled, &typ); err != nil {
+		return adapters.RouterConfig{}, err
+	}
+	isRouter := gateway || secondary
+	if in.IsGateway != nil {
+		gateway = *in.IsGateway
+		if gateway {
+			isRouter = true
+		}
+	}
+	if in.IsRouter != nil {
+		isRouter = *in.IsRouter
+	}
+	secondary = isRouter && !gateway
+	if in.AgentOnly != nil {
+		agentOnly = *in.AgentOnly
+	}
+	if in.SnmpEnabled != nil {
+		snmpEnabled = *in.SnmpEnabled
+	}
+	if in.Type != nil {
+		typ = *in.Type
+	}
+	if err := ValidateRole(gateway, isRouter, agentOnly, snmpEnabled, typ); err != nil {
+		return adapters.RouterConfig{}, err
 	}
 
 	if in.IsGateway != nil && *in.IsGateway {
-		if _, err := tx.Exec("UPDATE routers SET is_gateway = 0 WHERE id != ?", id); err != nil {
-			return adapters.RouterConfig{}, false
+		if _, err := tx.Exec("UPDATE routers SET is_gateway = 0, is_secondary_router = 1 WHERE id != ? AND is_gateway = 1", id); err != nil {
+			return adapters.RouterConfig{}, err
 		}
 	}
 
 	sets := []string{}
 	args := []any{}
+	if in.IsRouter != nil || in.IsGateway != nil {
+		sets = append(sets, "is_secondary_router = ?")
+		args = append(args, secondary)
+	}
 	if in.Name != nil {
 		sets = append(sets, "name = ?")
 		args = append(args, *in.Name)
@@ -358,19 +405,19 @@ func UpdateRouter(db *sql.DB, id string, in UpdateInput) (adapters.RouterConfig,
 	if len(sets) > 0 {
 		args = append(args, id)
 		if _, err := tx.Exec("UPDATE routers SET "+strings.Join(sets, ", ")+" WHERE id = ?", args...); err != nil {
-			return adapters.RouterConfig{}, false
+			return adapters.RouterConfig{}, err
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return adapters.RouterConfig{}, false
+		return adapters.RouterConfig{}, err
 	}
 	for _, r := range ListRouters(db) {
 		if r.ID == id {
-			return r, true
+			return r, nil
 		}
 	}
-	return adapters.RouterConfig{}, false
+	return adapters.RouterConfig{}, sql.ErrNoRows
 }
 
 // ---------------------------------------------------------------------------

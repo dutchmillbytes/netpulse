@@ -150,6 +150,7 @@ export function manufacturerLabel(manufacturer: string): string {
 /** Rol canónico del dataset ("Principal" | "AP") → idioma activo */
 export function roleLabel(role: string): string {
   if (role === 'Principal') return i18n.t('common.rolePrimary')
+  if (role === 'Secondary') return i18n.t('common.roleSecondary')
   if (role === 'AP') return i18n.t('common.roleAP')
   return role
 }

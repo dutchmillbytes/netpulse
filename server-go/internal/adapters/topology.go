@@ -20,11 +20,11 @@ import (
 //   - Se excluyen las MACs de los propios routers (su bridge br-lan) y las
 //     de clientes atribuidos a OTROS routers (los clientes wifi de un AP
 //     aparecen en el FDB del gateway por el puerto del uplink).
-//   - Anclaje al GATEWAY (decisión del usuario 2-Ago-2026): los nodos
-//     "inferred" SOLO se crean en el gateway. En un AP, un puerto multi-MAC
+//   - Anclaje al router de rol: los nodos "inferred" se crean en cada
+//     router principal o secundario. En un AP, un puerto multi-MAC
 //     es casi seguro su UPLINK (aprende las MACs de toda la LAN) y el FDB
 //     no puede distinguirlo de un switch local → no se afirma nada: esos
-//     clientes quedan "sin evidencia" y el frontend los cuelgan del gateway.
+//     clientes quedan sin puerto; su routerId mantiene el sitio correcto.
 //     Única excepción tras un AP: hipervisor con evidencia clara (MACs OUI
 //     de hipervisor + exactamente un host) = servidor con VMs tras ese AP.
 //   - LLDP (Fase 2, contrato C2): si en un puerto multi-MAC se anuncia un
@@ -255,11 +255,17 @@ func inferTopology(polled map[string]*routerPolled, devices []Device) ([]Device,
 	}
 	sort.Strings(routerIDs)
 
-	// Gateway con la misma prioridad que pickGateway (is_gateway → glinet →
-	// primero): solo él puede anclar nodos "inferred".
-	gatewayID := ""
+	// Every routing root can anchor distribution on its own LAN. An AP's
+	// multi-MAC port still looks like an uplink and is not inferred as a switch.
+	routingRoots := map[string]bool{}
+	primaryID := ""
 	if gw := pickGatewayCfg(polled); gw != nil {
-		gatewayID = gw.ID
+		primaryID = gw.ID
+	}
+	for _, p := range polled {
+		if p.cfg.ReceivesRouterChecks(primaryID) {
+			routingRoots[p.cfg.ID] = true
+		}
 	}
 	// Identidades de routers para el matching LLDP tolerante (issue #252):
 	// un vecino cuya mgmt-IP/nombre coincide con un router conocido identifica
@@ -338,7 +344,7 @@ func inferTopology(polled map[string]*routerPolled, devices []Device) ([]Device,
 			// LLDP-first (inferLldpLinks); este puerto solo llega aquí sin
 			// evidencia LLDP, así que sigue el flujo FDB (hipervisor ya
 			// descartado arriba).
-			if routerID != gatewayID && !polled[routerID].cfg.AgentOnly {
+			if !routingRoots[routerID] && !polled[routerID].cfg.AgentOnly {
 				// AP con puerto multi-MAC sin evidencia de hipervisor: es casi
 				// seguro su uplink (aprende las MACs de toda la LAN). No se
 				// afirma switch local ni se anota puerto: los clientes quedan
@@ -351,7 +357,7 @@ func inferTopology(polled map[string]*routerPolled, devices []Device) ([]Device,
 			dn := DistributionNode{
 				ID: id, Kind: "inferred", RouterID: routerID, Port: port, PortLabel: portLabel(p, port), MacCount: len(kept),
 			}
-			if routerID == gatewayID {
+			if routingRoots[routerID] {
 				for _, rp := range polled {
 					if !rp.cfg.AgentOnly {
 						continue

@@ -4,7 +4,7 @@ import type { LucideIcon } from 'lucide-react'
 import { motion, useReducedMotion } from 'framer-motion'
 import { Area, AreaChart, ResponsiveContainer, Tooltip } from 'recharts'
 import { useTranslation } from 'react-i18next'
-import { fmtUptime } from '@/i18n'
+import { fmtUptime, roleLabel } from '@/i18n'
 import type { Router } from '@/data/mock'
 import { fmtRate } from '@/components/routers/PortSeriesChart'
 import { HealthRing } from '@/components/HealthRing'
@@ -99,6 +99,7 @@ export function FleetCard({ router, index = 0, refreshKey = 0 }: FleetCardProps)
   // El gateway real lo marca el server (roleBadge 'Principal'): su tarjeta
   // lleva la pill verde "puerta de enlace", el tile en acento y su modelo.
   const isPrimary = router.roleBadge === 'Principal'
+  const isRouter = router.roleBadge === 'Principal' || router.roleBadge === 'Secondary'
   // Sparkline 24h (buckets horarios, último = hora actual). Etiqueta cada
   // punto con su hora para el tooltip (#654).
   const traffic = router.sparkline.map((v, i) => {
@@ -185,16 +186,16 @@ export function FleetCard({ router, index = 0, refreshKey = 0 }: FleetCardProps)
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <h3 className="truncate font-display text-h2 text-text-primary">{router.name}</h3>
-                {isPrimary && <StatusPill tone="ok" label={t('routers.mainGateway')} />}
+                <StatusPill tone={isPrimary ? 'ok' : 'accent'} label={roleLabel(router.roleBadge)} />
                 <AgentBadge agent={agent} agentOnly={router.agentOnly} deviceType={router.type} />
               </div>
               <div className="truncate text-caption text-text-muted">
                 {isPrimary ? router.model : `OpenWrt · ${router.modelShort}`}
               </div>
-              {isPrimary && (
+              {isRouter && (
                 <div className="mt-1.5 inline-flex items-center gap-1.5 rounded-full bg-elevated px-2 py-0.5">
-                  <span className="h-1.5 w-1.5 rounded-full bg-ok" />
-                  <span className="text-[10px] font-semibold uppercase tracking-wide text-text-secondary">AdGuard</span>
+                  {isPrimary && <><span className="h-1.5 w-1.5 rounded-full bg-ok" />
+                  <span className="text-[10px] font-semibold uppercase tracking-wide text-text-secondary">AdGuard</span></>}
                   <span className="h-1.5 w-1.5 rounded-full bg-tunnel" />
                   <span className="text-[10px] font-semibold uppercase tracking-wide text-text-secondary">WireGuard</span>
                 </div>

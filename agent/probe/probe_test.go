@@ -191,6 +191,11 @@ func TestParsePingSummary(t *testing.T) {
 	if lat == nil || *lat != 9 || loss == nil || *loss != 0 {
 		t.Fatalf("ping: %v %v", lat, loss)
 	}
+	busybox := "3 packets transmitted, 3 packets received, 0% packet loss\nround-trip min/avg/max = 8.123/9.456/10.999 ms"
+	lat, loss = ParsePingSummary(busybox)
+	if lat == nil || *lat != 9 || loss == nil || *loss != 0 {
+		t.Fatalf("busybox ping: %v %v", lat, loss)
+	}
 	if lat, _ := ParsePingSummary("2 packets transmitted, 0 received, 100% packet loss"); lat != nil {
 		t.Fatalf("sin rtt → nil: %v", lat)
 	}

@@ -9,17 +9,22 @@ import { TopDevices } from '@/sections/TopDevices'
 import { WanTraffic } from '@/sections/WanTraffic'
 import { useNetPulse } from '@/data/DataProvider'
 import { useServicesVisibility } from '@/hooks/useServicesVisibility'
+import { groupWireGuardInstances } from '@/sections/wireguardGroups'
 
 /** Página Resumen `/` (home.md) */
 export default function Home() {
-  const { isDemo } = useNetPulse()
+  const { isDemo, wireguards, routers } = useNetPulse()
   const [services] = useServicesVisibility()
   // Clave ESTABLE por tarjeta (#223): si AdGuard/WireGuard se deshabilitan en
   // Ajustes la lista se reordena y, con key={i}, React remontaría RecentAlerts
   // y perdería su readIds. Cada id identifica al hijo, no su posición.
   const cards: { id: string; node: ReactNode }[] = []
   if (services.adguard) cards.push({ id: 'adguard', node: <AdGuardCard /> })
-  if (services.wireguard) cards.push({ id: 'wireguard', node: <WireGuardCard /> })
+  if (services.wireguard) {
+    for (const group of groupWireGuardInstances(wireguards, routers)) {
+      cards.push({ id: `wireguard-${group.id}`, node: <WireGuardCard group={group} /> })
+    }
+  }
   cards.push({ id: 'alerts', node: <RecentAlerts /> })
   const span = Math.max(4, Math.floor(12 / cards.length))
   const spanCls = {
