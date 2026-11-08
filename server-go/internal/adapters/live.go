@@ -102,13 +102,14 @@ func pickGatewayCfg(polled map[string]*routerPolled) *RouterConfig {
 
 // routerPolled es el sondeo de un tick de un router.
 type routerPolled struct {
-	cfg     RouterConfig
-	client  *OpenWrtClient
-	sysInfo *SysInfo
-	board   *BoardInfo
-	cpu     int
-	ram     int
-	temp    int
+	roleEvidence *probe.RoleEvidence
+	cfg          RouterConfig
+	client       *OpenWrtClient
+	sysInfo      *SysInfo
+	board        *BoardInfo
+	cpu          int
+	ram          int
+	temp         int
 	// #1256: SNMP rellena sysDescr (nombre/modelo completo del switch) y,
 	// en MikroTik SwOS, la temperatura del chasis (hasTemp). hasTemp
 	// distingue "no aplica" de "0 °C" para no pisar el null de #441.
@@ -1760,7 +1761,8 @@ func (l *Live) buildRouter(p *routerPolled, history []histPoint) Router {
 	// las lecturas que la fuente sí confirma (hasCpu/hasRam/hasTemp) se conservan.
 	noVitals := p.cfg.SnmpEnabled || p.agentKind == "external"
 	r := Router{
-		ID: p.cfg.ID, Name: name, Model: model, ModelShort: model,
+		RoleEvidence: p.roleEvidence,
+		ID:           p.cfg.ID, Name: name, Model: model, ModelShort: model,
 		IP: p.cfg.Host, Status: status, Health: health,
 		CPU: vitalInt(p.hasCpu, p.cpu), RAM: vitalInt(p.hasRam, p.ram), Temp: vitalInt(p.hasTemp, p.temp),
 		Uptime: uptimeLabel(p), Clients: len(p.leases),
@@ -1956,6 +1958,7 @@ func (l *Live) offlineRouter(cfg RouterConfig) Router {
 		r.Role, r.RoleBadge = displayRole(nil, cfg, gw != nil && cfg.ID == gw.ID)
 	}
 	r.Type = cfg.Type
+	r.RoleEvidence = nil
 	r.Status = "offline"
 	if l.accessMissing(cfg.ID) {
 		r.Status = "unreachable"

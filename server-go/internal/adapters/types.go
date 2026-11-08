@@ -16,6 +16,7 @@ import (
 	"net"
 	"strconv"
 
+	"github.com/gnacho/netpulse/agent/probe"
 	"github.com/gnacho/netpulse/server-go/internal/alerts"
 )
 
@@ -150,15 +151,16 @@ type WireGuardStats struct {
 // CPU/RAM/Temp son *int porque el live puede emitir null en el primer tick
 // (primera muestra de /proc/stat; SPEC §7.2 getCpuPercent).
 type Router struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Model      string `json:"model"`
-	ModelShort string `json:"modelShort"`
-	Role       string `json:"role"`
-	RoleBadge  string `json:"roleBadge"`
-	IP         string `json:"ip"`
-	MAC        string `json:"mac,omitempty"`      // ausente si no se conoce (undefined)
-	Firmware   string `json:"firmware,omitempty"` // ausente si no se conoce
+	RoleEvidence *probe.RoleEvidence `json:"roleEvidence,omitempty"`
+	ID           string              `json:"id"`
+	Name         string              `json:"name"`
+	Model        string              `json:"model"`
+	ModelShort   string              `json:"modelShort"`
+	Role         string              `json:"role"`
+	RoleBadge    string              `json:"roleBadge"`
+	IP           string              `json:"ip"`
+	MAC          string              `json:"mac,omitempty"`      // ausente si no se conoce (undefined)
+	Firmware     string              `json:"firmware,omitempty"` // ausente si no se conoce
 	// FirmwareTarget: versión objetivo configurada por el admin (issue #241).
 	// Ausente si no está configurado (sin comprobación).
 	FirmwareTarget string `json:"firmwareTarget,omitempty"`

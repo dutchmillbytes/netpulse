@@ -43,8 +43,10 @@ type AgentState struct {
 	// sin este recuerdo, MatchRouter perdería al agente hasta el próximo
 	// push completo y cada roam de un cliente provocaría un "sin cliente"
 	// transitorio en routers agent-only emparejados por hostname/MAC.
-	Host      string
-	BridgeMAC string
+	Host         string
+	BridgeMAC    string
+	roleEvidence *probe.RoleEvidence
+	roleExpires  time.Time
 }
 
 // effectiveTTL devuelve la ventana de frescura del estado: el TTL base, o
@@ -91,6 +93,19 @@ func (r *AgentRegistry) Ingest(p *probe.Payload) {
 		Payload: p, LastSeen: r.now(), Version: p.Version,
 		Kind: p.Kind, Interval: p.Interval,
 	}
+	if p.Data.Roles != nil {
+		// Expose collected facts only, never role labels supplied by a pusher.
+		st.roleEvidence = &probe.RoleEvidence{ObservedAtMs: p.Data.Roles.ObservedAtMs, Config: p.Data.Roles.Config}
+		observed := time.UnixMilli(p.Data.Roles.ObservedAtMs)
+		if p.Data.Roles.ObservedAtMs == 0 {
+			observed = st.LastSeen
+		}
+		// Never extend freshness for a device clock ahead of the server.
+		if observed.After(st.LastSeen) {
+			observed = st.LastSeen
+		}
+		st.roleExpires = observed.Add(r.effectiveTTL(st))
+	}
 	if sd := p.Data.System; sd != nil {
 		if sd.Board != nil {
 			st.Host = sd.Board.Hostname
@@ -100,6 +115,9 @@ func (r *AgentRegistry) Ingest(p *probe.Payload) {
 	// #852: un push wireless-only no trae identidad; hereda la última
 	// conocida para que MatchRouter siga emparejando al agente.
 	if prev := r.states[p.Router]; prev != nil {
+		if st.roleEvidence == nil && agentSourceClass(st.Kind) == agentSourceClass(prev.Kind) {
+			st.roleEvidence, st.roleExpires = prev.roleEvidence, prev.roleExpires
+		}
 		if st.Host == "" {
 			st.Host = prev.Host
 		}
@@ -277,7 +295,14 @@ func (r *AgentRegistry) Fresh(slug string) (*probe.Payload, bool) {
 	if !ok || r.now().Sub(st.LastSeen) > r.effectiveTTL(st) {
 		return nil, false
 	}
-	return st.Payload, true
+	// Event-only pushes must not refresh the age of the last observation.
+	snapshot := *st.Payload
+	if r.now().Before(st.roleExpires) {
+		snapshot.Data.Roles = st.roleEvidence
+	} else {
+		snapshot.Data.Roles = nil
+	}
+	return &snapshot, true
 }
 
 // Expired reporta si el slug tiene agente conocido pero su último push
@@ -298,7 +323,9 @@ func (r *AgentRegistry) StalePayload(slug string) (*probe.Payload, bool) {
 	if !ok || st.Payload == nil {
 		return nil, false
 	}
-	return st.Payload, true
+	snapshot := *st.Payload
+	snapshot.Data.Roles = nil
+	return &snapshot, true
 }
 
 // StaleFor reporta si el slug lleva más de threshold sin empujar datos.
@@ -818,6 +845,7 @@ func (l *Live) polledFromAgent(cfg RouterConfig, p *probe.Payload) *routerPolled
 	// #441: conservar el kind del agente: los pushers externos (beacon/
 	// scraper) no llevan sección system y el router queda sin vitals.
 	out.agentKind = p.Kind
+	out.roleEvidence = p.Data.Roles
 	// #1871: el kind del payload es opcional y las integraciones que empujan
 	// no lo rellenan, pero el registro ya sabe que la unidad no corre el
 	// agente nativo. Se sella en el polled y no en el payload a propósito:
