@@ -386,6 +386,14 @@ func (p *Prober) Build(ctx context.Context, router, version string) *Payload {
 	}
 	// Wan antes que FDB: probeFDB usa la boca del uplink para marcarla.
 	pl.Data.Wan = p.probeWan(ctx)
+	// Bound collection time and timestamp the observation only when parsing
+	// returns evidence. The server uses the timestamp to assess freshness.
+	if raw := p.runBest(ctx, CmdRoleEvidence, 4*time.Second); raw != "" {
+		pl.Data.Roles = ParseRoleEvidence(raw)
+		if pl.Data.Roles != nil {
+			pl.Data.Roles.ObservedAtMs = time.Now().UnixMilli()
+		}
+	}
 	pl.Data.Vlans, pl.Data.Networks = p.probeVlans(ctx)
 	pl.Data.System = p.probeSystem(ctx)
 	pl.Data.Wireless = p.probeWireless(ctx, true)

@@ -1,0 +1,37 @@
+==network==
+{"interface":[{"interface":"lan","up":true,"l3_device":"br-lan.1","device":"br-lan.1","route":[{"target":"0.0.0.0","mask":0}]},{"interface":"loopback","up":true,"l3_device":"lo","device":"lo","route":[]},{"interface":"things","up":true,"l3_device":"br-lan.2","device":"br-lan.2","route":[]}]}
+==firewall==
+firewall.@zone[0]=zone
+firewall.@zone[0].name='lan'
+firewall.@zone[0].network='lan'
+firewall.@zone[1]=zone
+firewall.@zone[1].name='wan'
+firewall.@zone[1].network='wan' 'wan6'
+firewall.@forwarding[0]=forwarding
+firewall.@forwarding[0].src='lan'
+firewall.@forwarding[0].dest='wan'
+==forwarding==
+ipv4=1
+ipv6=1
+==wireless==
+phy#1
+	Interface vxlmesh
+		type mesh point
+	Interface phy1-ap0
+		type AP
+phy#0
+	Interface phy0-ap0
+		type AP
+==wireless-devices==
+known
+phy0
+phy1
+phy0-ap0
+phy1-ap0
+vxlmesh
+==devices==
+{"br-lan":{"type":"bridge","bridge-members":["lan","phy0-ap0","phy1-ap0","wan"]},"br-lan.1":{"type":"8021q"},"br-lan.2":{"type":"8021q"},"eth0":{"type":"Network device"},"lan":{"type":"Network device"},"lo":{"type":"Network device"},"phy0-ap0":{"type":"Network device"},"phy1-ap0":{"type":"Network device"},"vxlmesh":{"type":"Network device"},"wan":{"type":"Network device"}}
+==ethernet-ports==
+known
+lan
+wan

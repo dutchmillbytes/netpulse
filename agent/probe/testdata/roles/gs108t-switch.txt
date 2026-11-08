@@ -1,0 +1,23 @@
+==network==
+{"interface":[{"interface":"lan","up":true,"l3_device":"switch.1","device":"switch.1","route":[{"target":"0.0.0.0","mask":0}]},{"interface":"loopback","up":true,"l3_device":"lo","device":"lo","route":[]}]}
+==firewall==
+
+==forwarding==
+ipv4=0
+ipv6=0
+==wireless==
+unavailable
+==wireless-devices==
+known
+==devices==
+{"eth0":{"type":"Network device"},"lan1":{"type":"Network device"},"lan2":{"type":"Network device"},"lan3":{"type":"Network device"},"lan4":{"type":"Network device"},"lan5":{"type":"Network device"},"lan6":{"type":"Network device"},"lan7":{"type":"Network device"},"lan8":{"type":"Network device"},"lo":{"type":"Network device"},"switch":{"type":"bridge","bridge-members":["lan1","lan2","lan3","lan4","lan5","lan6","lan7","lan8"]},"switch.1":{"type":"VLAN"},"switch.2":{"type":"VLAN"}}
+==ethernet-ports==
+known
+lan1
+lan2
+lan3
+lan4
+lan5
+lan6
+lan7
+lan8

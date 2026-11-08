@@ -29,6 +29,9 @@ type Payload struct {
 // sonda fallida en este push (el servidor conserva el último dato bueno,
 // mismo anti-parpadeo que el pipeline SSH).
 type PayloadData struct {
+	// Roles contains observed configuration, not roles assigned by the agent.
+	// It is omitted when the probe does not return parseable evidence.
+	Roles    *RoleEvidence `json:"roles,omitempty"`
 	System   *SystemData   `json:"system,omitempty"`
 	Wireless *WirelessData `json:"wireless,omitempty"`
 	DHCP     *DHCPData     `json:"dhcp,omitempty"`
